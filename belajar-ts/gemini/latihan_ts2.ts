@@ -14,4 +14,13 @@ interface Product {
 
 function UpdateStock (product: Product, quantity: number): Product {
     const newStock = product.stock + quantity;
+
+ if (newStock < 0) {
+        throw new Error("Stock tidak boleh kurang dari 0");
+    }
+
+    return {
+        ...product,
+        stock: newStock
+    };
 }
