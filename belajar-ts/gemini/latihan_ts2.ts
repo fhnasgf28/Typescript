@@ -12,3 +12,6 @@ interface Product {
     description?: string;
 }
 
+function UpdateStock (product: Product, quantity: number): Product {
+    const newStock = product.stock + quantity;
+}
