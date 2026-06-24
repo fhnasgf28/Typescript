@@ -13,7 +13,7 @@ pip install -e '.[test]'
 
 ## Runtime config
 
-Copy `examples/peers.json` and `examples/destinations.json` into `/home/fhnasgf/mcp-transfer/config/`. Set env vars shown in `.env.example`. Expose `http://127.0.0.1:8787` through Cloudflare Tunnel to a subdomain such as `server-a.clipperyt.online`.
+Copy `examples/peers.json` and `examples/destinations.json` into `/home/fhnasgf/mcp-transfer/config/`. Set env vars shown in `.env.example`. `MCP_TRANSFER_HOME_ALLOWLIST_PREFIX` defaults to `/home/fhnasgf`; override it only for a different deployment home, and keep `MCP_TRANSFER_BASE_DIR` under that prefix. Expose `http://127.0.0.1:8787` through Cloudflare Tunnel to a subdomain such as `server-a.clipperyt.online`.
 
 ## Run
 

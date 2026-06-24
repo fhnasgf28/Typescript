@@ -43,6 +43,23 @@ def test_load_settings_rejects_base_dir_outside_home() -> None:
         load_settings(env)
 
 
+def test_load_settings_accepts_custom_home_allowlist_prefix(tmp_path: Path) -> None:
+    base_dir = tmp_path / "runtime"
+    env = {
+        "MCP_TRANSFER_SERVER_NAME": "server-b",
+        "MCP_TRANSFER_HOME_ALLOWLIST_PREFIX": str(tmp_path),
+        "MCP_TRANSFER_BASE_DIR": str(base_dir),
+        "MCP_TRANSFER_MAX_FILE_MB": "50",
+        "MCP_TRANSFER_WEB_ADMIN_PASSWORD": "admin-password",
+        "MCP_TRANSFER_SESSION_SECRET": "session-secret-with-more-than-32-chars",
+        "MCP_TRANSFER_PUBLIC_URL": "https://server-b.clipperyt.online",
+    }
+
+    settings = load_settings(env)
+
+    assert settings.base_dir == base_dir
+
+
 def test_load_destinations_reads_aliases(tmp_path: Path) -> None:
     config_path = tmp_path / "destinations.json"
     config_path.write_text(
