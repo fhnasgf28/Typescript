@@ -1,13 +1,24 @@
 # MCP Transfer Node
 
-Direct server-to-server file transfer node with a FastAPI web UI and MCP tools.
+FastAPI receiver + simple Web UI + MCP tools for direct server-to-server transfer via Cloudflare Tunnel. Runtime data lives in `/home/fhnasgf/mcp-transfer/`; inbox is `/home/fhnasgf/mcp-transfer/inbox/`. All file types are accepted as binary up to 50 MB.
 
-## Development
+## Install
 
-1. Create and activate a Python 3.11 virtual environment.
-2. Install the project in editable mode with test dependencies.
-3. Copy `.env.example` to `.env` and adjust local values.
+```bash
+cd /home/fhnasgf/mcp-transfer-node
+python3.12 -m venv .venv
+. .venv/bin/activate
+pip install -e '.[test]'
+```
 
-## Configuration
+## Runtime config
 
-The project reads settings from environment variables and JSON configuration files for destinations and allowed peers.
+Copy `examples/peers.json` and `examples/destinations.json` into `/home/fhnasgf/mcp-transfer/config/`. Set env vars shown in `.env.example`. Expose `http://127.0.0.1:8787` through Cloudflare Tunnel to a subdomain such as `server-a.clipperyt.online`.
+
+## Run
+
+```bash
+mcp-transfer-serve
+```
+
+MCP command: `/home/fhnasgf/mcp-transfer-node/.venv/bin/mcp-transfer-mcp`.
