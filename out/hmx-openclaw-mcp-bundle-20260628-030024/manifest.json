@@ -1,0 +1,12 @@
+{
+  "bundle": "hmx-openclaw-mcp-bundle-20260628-030024",
+  "createdBy": "adminftp on source OpenClaw server",
+  "containsSecrets": false,
+  "mcpServers": [
+    "hmx-mr-log",
+    "hmx-bug-tracker-sheets"
+  ],
+  "notes": [
+    "Credential files and private IDs are intentionally not bundled. Fill config placeholders on destination."
+  ]
+}

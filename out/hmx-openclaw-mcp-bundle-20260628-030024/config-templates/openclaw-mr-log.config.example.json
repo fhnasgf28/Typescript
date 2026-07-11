@@ -1,0 +1,16 @@
+{
+  "gitlabBaseUrl": "https://gitlab.com",
+  "gitlabTokenPath": "/home/adminftp/.config/openclaw-mr-log/gitlab-token",
+  "googleCredentialsPath": "/home/adminftp/.config/openclaw-mr-log/google-service-account.json",
+  "spreadsheetId": "REPLACE_WITH_GOOGLE_SPREADSHEET_ID",
+  "sheetId": "REPLACE_WITH_HR_SHEET_ID",
+  "defaultAuthor": "Farhan",
+  "xlsxSheetName": "HR",
+  "gitlabProjectPath": "hashmicro1/hmx/hmx-002",
+  "gitlabTargetBranch": "Human-Resources",
+  "gitlabSourceBranch": "feat/loan-policy-autocode-clean",
+  "writeColumnLimit": 5,
+  "developerName": "Farhan",
+  "rollbackDir": "/home/adminftp/.local/share/openclaw-mr-log/backups",
+  "backupRetention": 20
+}

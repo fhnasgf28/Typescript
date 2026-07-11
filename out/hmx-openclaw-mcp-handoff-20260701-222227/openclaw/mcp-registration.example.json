@@ -1,0 +1,22 @@
+{
+  "mcp": {
+    "servers": {
+      "hmx-hashmicro-chat": {
+        "command": "/home/adminftp/.nvm/versions/node/v22.22.3/bin/node",
+        "args": ["/home/adminftp/farhan/openclaw-hashmicro-chat-mcp/server.mjs"]
+      },
+      "hmx-internal-status": {
+        "command": "/home/adminftp/.nvm/versions/node/v22.22.3/bin/node",
+        "args": ["/home/adminftp/farhan/openclaw-internal-status-mcp/server.mjs"]
+      },
+      "hmx-mr-log": {
+        "command": "/home/adminftp/.nvm/versions/node/v22.22.3/bin/node",
+        "args": ["/home/adminftp/farhan/openclaw-mr-log-mcp/server.mjs"]
+      },
+      "hmx-bug-tracker-sheets": {
+        "command": "/home/adminftp/.nvm/versions/node/v22.22.3/bin/node",
+        "args": ["/home/adminftp/farhan/openclaw-spreadsheet-mcp/server.mjs"]
+      }
+    }
+  }
+}

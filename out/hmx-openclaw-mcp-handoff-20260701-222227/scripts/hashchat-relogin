@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+BASE=/home/adminftp/farhan/openclaw-hashmicro-chat-mcp
+NODE=/home/adminftp/.nvm/versions/node/v22.22.3/bin/node
+CRED=/home/adminftp/.config/openclaw-hashmicro-chat/credential.env
+mkdir -p "$(dirname "$CRED")"
+if [[ ! -s "$CRED" ]]; then
+  read -r -p "HashMicro Chat username/email: " HASHCHAT_USERNAME
+  read -r -s -p "HashMicro Chat password: " HASHCHAT_PASSWORD
+  printf "\n"
+  umask 077
+  {
+    printf '%s=%q\n' HASHCHAT_USERNAME "$HASHCHAT_USERNAME"
+    printf '%s=%q\n' HASHCHAT_PASSWORD "$HASHCHAT_PASSWORD"
+  } > "$CRED"
+  chmod 600 "$CRED"
+fi
+cd "$BASE"
+REQ1='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+REQ2='{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}'
+REQ3='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"setup_hashchat_browser_session","arguments":{}}}'
+OUT=$(printf "%s\n%s\n%s\n" "$REQ1" "$REQ2" "$REQ3" | "$NODE" server.mjs)
+if printf "%s" "$OUT" | grep -q '"isError"[[:space:]]*:[[:space:]]*true'; then
+  echo "HashMicro Chat relogin gagal. Credential sementara masih disimpan di $CRED untuk retry."
+  exit 1
+fi
+if printf "%s" "$OUT" | grep -qi 'success\|readyForSend\|logged'; then
+  rm -f "$CRED"
+  echo "HashMicro Chat relogin berhasil. Credential sementara sudah dihapus."
+else
+  echo "HashMicro Chat relogin selesai, tapi status sukses tidak terbaca jelas. Cek dengan OpenClaw get_hashchat_connector_status."
+fi

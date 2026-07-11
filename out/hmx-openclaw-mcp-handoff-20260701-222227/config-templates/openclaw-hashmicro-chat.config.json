@@ -1,0 +1,13 @@
+{
+  "chatUrl": "https://chat.hashmicro.com/chat",
+  "groupName": "Farhan DevTeam - Support Team",
+  "conversationId": "FILL_ON_TARGET_BY_SETUP_OR_DISCOVERY",
+  "sendEnabled": false,
+  "requireExplicitSend": true,
+  "selectorsConfigured": true,
+  "browserRuntime": "/home/adminftp/farhan/openclaw-hashmicro-chat-mcp/node_modules/playwright",
+  "browserUserDataDir": "/home/adminftp/.local/share/openclaw-hashmicro-chat/browser-profile",
+  "stateDir": "/home/adminftp/.local/share/openclaw-hashmicro-chat",
+  "internalStatusMcpPath": "/home/adminftp/farhan/openclaw-internal-status-mcp/server.mjs",
+  "nodePath": "/home/adminftp/.nvm/versions/node/v22.22.3/bin/node"
+}

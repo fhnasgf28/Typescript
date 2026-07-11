@@ -1,0 +1,10 @@
+{
+  "assignee": "Farhan",
+  "sheetName": "Bug Tracker All",
+  "spreadsheetId": "FILL_WITH_TRACKER_SPREADSHEET_ID",
+  "sourceCacheFile": "/home/adminftp/.local/share/openclaw-bug-tracker/cache.json",
+  "cacheTtlMs": 480000,
+  "timeZone": "Asia/Jakarta",
+  "chatGroupName": "Farhan DevTeam - Support Team",
+  "sendEnabled": false
+}

@@ -1,0 +1,7 @@
+{
+  "spreadsheetId": "FILL_WITH_TRACKER_SPREADSHEET_ID",
+  "sheetName": "Bug Tracker All",
+  "assignee": "Farhan",
+  "cacheFile": "/home/adminftp/.local/share/openclaw-bug-tracker/cache.json",
+  "cacheTtlMs": 480000
+}
