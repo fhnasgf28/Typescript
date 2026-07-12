@@ -28,6 +28,8 @@ test = [
 [project.scripts]
 mcp-transfer-serve = "mcp_transfer_node.app:run"
 mcp-transfer-mcp = "mcp_transfer_node.mcp_server:run"
+mcp-pmt-mcp = "mcp_transfer_node.pmt_mcp_server:run"
+mcp-pmt-worker = "mcp_transfer_node.pmt_worker:run"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -9,6 +11,8 @@ from mcp_transfer_node.api import create_api_router
 from mcp_transfer_node.config import TransferSettings, load_settings
 from mcp_transfer_node.files import ensure_runtime_dirs
 from mcp_transfer_node.logging_config import configure_logging
+from mcp_transfer_node.pmt_api import create_pmt_api_router
+from mcp_transfer_node.pmt_web import create_pmt_web_router
 from mcp_transfer_node.responses import error_response
 from mcp_transfer_node.web import create_web_router
 
@@ -37,9 +41,13 @@ def create_app(settings: TransferSettings | None = None) -> FastAPI:
         )
 
     app.include_router(create_api_router(resolved))
+    app.include_router(create_pmt_api_router(resolved))
+    app.include_router(create_pmt_web_router(resolved))
     app.include_router(create_web_router(resolved))
     return app
 
 
 def run() -> None:
-    uvicorn.run("mcp_transfer_node.app:create_app", factory=True, host="127.0.0.1", port=8787)
+    host = os.environ.get("MCP_TRANSFER_BIND_HOST", "127.0.0.1")
+    port = int(os.environ.get("MCP_TRANSFER_BIND_PORT", "8787"))
+    uvicorn.run("mcp_transfer_node.app:create_app", factory=True, host=host, port=port)

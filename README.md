@@ -1,6 +1,8 @@
-# MCP Transfer Node
+# MCP Transfer Node + Standalone PMT
 
-FastAPI receiver + simple Web UI + MCP tools for direct server-to-server transfer via Cloudflare Tunnel. Runtime data lives in `/home/fhnasgf/mcp-transfer/`; inbox is `/home/fhnasgf/mcp-transfer/inbox/`. All file types are accepted as binary up to 50 MB.
+FastAPI receiver + Web UI + MCP tools for direct server-to-server transfer via Cloudflare Tunnel. The repository now also contains a standalone PMT MVP for coordinating HMX tasks across multiple OpenClaw servers through a central authenticated API, transactional task leases, a Web dashboard, remote MCP tools, durable schedules, and read-only Google Sheet task import.
+
+Runtime data lives in `/home/fhnasgf/mcp-transfer/`; transfer inbox is `/home/fhnasgf/mcp-transfer/inbox/`, while PMT state is stored in `/home/fhnasgf/mcp-transfer/pmt/pmt.sqlite3`. All transferred file types are accepted as binary up to 50 MB.
 
 ## Install
 
@@ -21,4 +23,29 @@ Copy `examples/peers.json` and `examples/destinations.json` into `/home/fhnasgf/
 mcp-transfer-serve
 ```
 
-MCP command: `/home/fhnasgf/mcp-transfer-node/.venv/bin/mcp-transfer-mcp`.
+MCP transfer command: `/home/fhnasgf/mcp-transfer-node/.venv/bin/mcp-transfer-mcp`.
+
+## Standalone PMT MVP
+
+After login, open `/pmt` to use the task dashboard. Agent API routes live under `/api/v1/pmt` and use the existing peer bearer-token registry with `X-PMT-Agent` identity binding.
+
+Install the remote PMT MCP adapter on each OpenClaw server:
+
+```bash
+export MCP_PMT_API_URL=https://pmt.example.com
+export MCP_PMT_API_TOKEN='<local-secret>'
+export MCP_PMT_AGENT_ID=openclaw-server-a
+mcp-pmt-mcp
+```
+
+The central schedule worker executes one due job per invocation:
+
+```bash
+MCP_PMT_AGENT_ID=pmt-scheduler mcp-pmt-worker
+```
+
+Current executable schedule type: `google_sheet_sync`, restricted to HTTPS Google Docs CSV URLs and defaulting to Farhan tasks with `Dev Status = To-Do`.
+
+Full architecture, API examples, multi-server setup, security rules, scheduler guidance, HMX workflow, limitations, and roadmap:
+
+- [`docs/standalone-pmt.md`](docs/standalone-pmt.md)

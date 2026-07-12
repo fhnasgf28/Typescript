@@ -36,6 +36,14 @@ class TransferSettings:
     def logs_dir(self) -> Path:
         return self.base_dir / "logs"
 
+    @property
+    def pmt_dir(self) -> Path:
+        return self.base_dir / "pmt"
+
+    @property
+    def pmt_db_path(self) -> Path:
+        return self.pmt_dir / "pmt.sqlite3"
+
 
 @dataclass(frozen=True, slots=True)
 class Destination:

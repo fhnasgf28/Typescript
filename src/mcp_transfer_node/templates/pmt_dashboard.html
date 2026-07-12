@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PMT Dashboard · {{ settings.server_name }}</title>
+  <style>
+    :root{color-scheme:dark;--bg:#09111f;--panel:#111c2f;--line:#293955;--text:#eaf0fb;--muted:#91a2bd;--accent:#6ea8fe;--good:#46d19a;--warn:#f7c760;--danger:#ff7a90}
+    *{box-sizing:border-box} body{margin:0;background:linear-gradient(135deg,#08101d,#101b31);color:var(--text);font:14px/1.45 system-ui,sans-serif}
+    header{display:flex;align-items:center;justify-content:space-between;padding:20px 28px;border-bottom:1px solid var(--line);background:#09111ed9;position:sticky;top:0;z-index:2}
+    h1,h2,h3,p{margin-top:0} a{color:var(--accent)} main{padding:24px;max-width:1600px;margin:auto}.subtitle{color:var(--muted);margin:0}
+    .toolbar{display:flex;gap:12px;align-items:center}.button,button{border:1px solid #3a6db2;background:#245a9c;color:white;border-radius:8px;padding:9px 13px;text-decoration:none;cursor:pointer}
+    .layout{display:grid;grid-template-columns:minmax(260px,360px) 1fr;gap:22px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;box-shadow:0 12px 35px #0003}
+    label{display:block;color:var(--muted);font-size:12px;margin:10px 0 4px}input,textarea,select{width:100%;padding:9px 10px;border:1px solid #344762;border-radius:7px;background:#0b1526;color:var(--text)}textarea{min-height:84px;resize:vertical}
+    .board{display:grid;grid-template-columns:repeat(7,minmax(230px,1fr));gap:14px;overflow-x:auto;padding-bottom:10px}.column{background:#0d1728;border:1px solid var(--line);border-radius:12px;padding:12px;min-height:480px}.column h3{display:flex;justify-content:space-between;text-transform:capitalize}.count{background:#253650;color:#c8d4e8;border-radius:99px;padding:1px 8px}
+    .card{background:#152238;border:1px solid #30425f;border-radius:10px;padding:12px;margin-bottom:10px}.key{color:var(--accent);font-weight:700}.meta{color:var(--muted);font-size:12px;margin-top:8px}.priority-urgent{border-left:4px solid var(--danger)}.priority-high{border-left:4px solid var(--warn)}.priority-normal{border-left:4px solid var(--accent)}.priority-low{border-left:4px solid var(--good)}
+    code{color:#b9d6ff}@media(max-width:900px){.layout{grid-template-columns:1fr}.board{grid-template-columns:repeat(7,240px)}header{align-items:flex-start;gap:10px;flex-direction:column}}
+  </style>
+</head>
+<body>
+<header>
+  <div><h1>Standalone PMT</h1><p class="subtitle">Task orchestration untuk manusia dan multi-server AI agent</p></div>
+  <div class="toolbar"><a class="button" href="/">Transfer Node</a><form method="post" action="/logout"><button>Logout</button></form></div>
+</header>
+<main>
+  <div class="layout">
+    <aside class="panel">
+      <h2>Tambah task</h2>
+      <form method="post" action="/pmt/tasks">
+        <label>Judul</label><input name="title" required maxlength="300" placeholder="Contoh: Fix access right Employee">
+        <label>Deskripsi</label><textarea name="description" placeholder="Requirement dan konteks"></textarea>
+        <label>Project</label><input name="project" value="HMX">
+        <label>Module</label><input name="module" placeholder="core_hr">
+        <label>Menu / feature</label><input name="menu" placeholder="Employee / Manage Overtime">
+        <label>Assignee</label><input name="assignee" value="Farhan">
+        <label>Priority</label><select name="priority"><option>normal</option><option>high</option><option>urgent</option><option>low</option></select>
+        <label>Target branch</label><input name="target_branch" value="Human-Resources">
+        <p></p><button type="submit">Buat task</button>
+      </form>
+      <hr style="border-color:var(--line);margin:22px 0">
+      <p class="subtitle">Agent API: <code>/api/v1/pmt</code></p>
+      <p class="subtitle">Total task: {{ tasks|length }}</p>
+    </aside>
+    <section>
+      <div class="board">
+        {% for status_name, status_tasks in grouped.items() %}
+        <div class="column">
+          <h3>{{ status_name|replace('_',' ') }} <span class="count">{{ status_tasks|length }}</span></h3>
+          {% for task in status_tasks %}
+          <article class="card priority-{{ task.priority }}">
+            <div class="key">{{ task.task_key }}</div>
+            <strong>{{ task.title }}</strong>
+            {% if task.description %}<p class="meta">{{ task.description|truncate(140) }}</p>{% endif %}
+            <div class="meta">{{ task.project }}{% if task.module %} · {{ task.module }}{% endif %}</div>
+            {% if task.menu %}<div class="meta">{{ task.menu }}</div>{% endif %}
+            <div class="meta">Priority: {{ task.priority }}{% if task.assignee %} · {{ task.assignee }}{% endif %}</div>
+            {% if task.claimed_by %}<div class="meta">Agent: {{ task.claimed_by }}</div>{% endif %}
+          </article>
+          {% else %}<p class="subtitle">Belum ada task</p>{% endfor %}
+        </div>
+        {% endfor %}
+      </div>
+    </section>
+  </div>
+</main>
+</body>
+</html>
