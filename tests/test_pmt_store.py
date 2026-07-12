@@ -205,6 +205,43 @@ def test_manual_status_transition_supports_kanban_destinations(settings):
         store.admin_transition_task(task["task_key"], "in_progress", "web-admin")
 
 
+def test_remove_task_cleans_owned_records_and_rejects_active_claim(settings):
+    store = PmtStore(settings.pmt_db_path)
+    store.initialize()
+    task = store.create_task(TaskInput(title="Remove completed task"), actor="Farhan")
+    store.add_evidence(
+        task["task_key"],
+        evidence_type="test",
+        label="Removal coverage",
+        url="",
+        note="",
+        actor="Farhan",
+        expected_version=task["version"],
+    )
+    current = store.get_task(task["task_key"])
+    removed = store.remove_task(
+        task["task_key"], actor="Farhan", expected_version=current["version"]
+    )
+    assert removed["task_key"] == task["task_key"]
+    assert removed["removed_by"] == "Farhan"
+    assert store.get_task(task["task_key"]) is None
+    with store._connect() as db:
+        for table in ("task_events", "task_evidence", "task_runs", "task_context_documents"):
+            assert (
+                db.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE task_id=?", (task["id"],)
+                ).fetchone()[0]
+                == 0
+            )
+
+    active = store.create_task(TaskInput(title="Active task"))
+    store.register_agent("agent-remove", "server-a")
+    claimed = store.claim_task(active["task_key"], "agent-remove", "remove-claim", 600)
+    with pytest.raises(PermissionError, match="sedang dikerjakan agent"):
+        store.remove_task(active["task_key"], actor="Farhan", expected_version=claimed["version"])
+    assert store.get_task(active["task_key"]) is not None
+
+
 def test_schedule_claim_and_finish(settings):
     store = PmtStore(settings.pmt_db_path)
     store.initialize()

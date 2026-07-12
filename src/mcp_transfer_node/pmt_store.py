@@ -1371,6 +1371,7 @@ class PmtStore:
             if row["context_version"] != expected_context_version:
                 raise PermissionError("context changed since it was loaded; refresh and retry")
             metadata = self._context_document(row)
+            db.execute("DELETE FROM google_doc_task_creations WHERE context_id=?", (row["id"],))
             db.execute("DELETE FROM task_context_tabs WHERE context_document_id=?", (row["id"],))
             db.execute("DELETE FROM task_context_documents WHERE id=?", (row["id"],))
             self._event(
@@ -1387,6 +1388,71 @@ class PmtStore:
                 },
             )
         return metadata
+
+    def remove_task(
+        self,
+        task_ref: str,
+        *,
+        actor: str,
+        expected_version: int,
+    ) -> dict[str, Any]:
+        """Remove an inactive task and its task-owned records atomically."""
+        with self._transaction() as db:
+            task = self._task_row(db, task_ref)
+            self._require_task_version(task, expected_version)
+            if (
+                task["claimed_by"]
+                or task["current_run_id"]
+                or task["status"]
+                in {
+                    "claimed",
+                    "in_progress",
+                }
+            ):
+                raise PermissionError(
+                    "task sedang dikerjakan agent; pindahkan task ke status nonaktif sebelum dihapus"
+                )
+            unfinished_run = db.execute(
+                "SELECT 1 FROM task_runs WHERE task_id=? AND finished_at IS NULL LIMIT 1",
+                (task["id"],),
+            ).fetchone()
+            if unfinished_run is not None:
+                raise PermissionError(
+                    "task masih memiliki run aktif; selesaikan atau release run sebelum dihapus"
+                )
+            active_approval = db.execute(
+                """SELECT 1 FROM approval_requests
+                   WHERE task_id=? AND status IN ('pending','approved','executing') LIMIT 1""",
+                (task["id"],),
+            ).fetchone()
+            if active_approval is not None:
+                raise PermissionError(
+                    "task masih memiliki approval aktif; selesaikan atau batalkan approval sebelum dihapus"
+                )
+
+            metadata = self._task(task)
+            context_ids = db.execute(
+                "SELECT id FROM task_context_documents WHERE task_id=?", (task["id"],)
+            ).fetchall()
+            for context in context_ids:
+                db.execute(
+                    "DELETE FROM task_context_tabs WHERE context_document_id=?",
+                    (context["id"],),
+                )
+            db.execute("DELETE FROM google_doc_task_creations WHERE task_id=?", (task["id"],))
+            db.execute("DELETE FROM task_context_documents WHERE task_id=?", (task["id"],))
+            db.execute("DELETE FROM task_evidence WHERE task_id=?", (task["id"],))
+            db.execute("DELETE FROM task_events WHERE task_id=?", (task["id"],))
+            db.execute("DELETE FROM task_runs WHERE task_id=?", (task["id"],))
+            db.execute("UPDATE approval_requests SET task_id=NULL WHERE task_id=?", (task["id"],))
+            db.execute(
+                """UPDATE agents SET current_task_id=NULL,status='online',updated_at=?
+                   WHERE current_task_id=?""",
+                (iso(), task["id"]),
+            )
+            db.execute("DELETE FROM tasks WHERE id=?", (task["id"],))
+            metadata["removed_by"] = actor
+            return metadata
 
     def update_task(
         self,

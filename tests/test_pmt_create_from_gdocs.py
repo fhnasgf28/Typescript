@@ -135,6 +135,17 @@ def test_atomic_google_doc_create_is_idempotent_and_audited(settings) -> None:
         "task.context_attached",
     }
 
+    removed = store.remove_task_context_document(
+        first["task"]["task_key"],
+        first["context"]["id"],
+        actor="Farhan",
+        expected_version=first["task"]["version"],
+        expected_context_version=first["context"]["context_version"],
+    )
+    assert removed["id"] == first["context"]["id"]
+    assert store.list_task_context_documents(first["task"]["task_key"]) == []
+    assert store.get_google_doc_task_creation("create-1", DOC_URL) is None
+
 
 def test_atomic_google_doc_create_rolls_back_task_when_context_insert_fails(
     settings, monkeypatch

@@ -188,7 +188,9 @@
     </section>
   </main>
   <div class="toast-container position-fixed top-0 end-0 p-3 pmt-toast-container">
-    <div id="kanban-feedback" class="toast pmt-kanban-feedback border-0" role="status" aria-live="polite" aria-atomic="true">
+    <div id="kanban-feedback" class="toast pmt-kanban-feedback border-0"
+         role="status" aria-live="polite" aria-atomic="true"
+         data-initial-message="{{ flash.message if flash else '' }}" data-initial-tone="{{ flash.tone if flash else '' }}">
       <div class="d-flex align-items-center">
         <div class="toast-body fw-semibold" data-feedback-message></div>
         <button class="btn-close btn-close-white me-2 m-auto" type="button" data-bs-dismiss="toast" aria-label="Tutup"></button>
@@ -252,6 +254,9 @@
       feedback.classList.toggle('text-bg-danger', tone !== 'success');
       bootstrap.Toast.getOrCreateInstance(feedback, { delay: 4500 }).show();
     }
+
+    const initialMessage = feedback.dataset.initialMessage;
+    if (initialMessage) showFeedback(initialMessage, feedback.dataset.initialTone);
 
     function applyFilters() {
       const query = search.value.trim().toLowerCase();

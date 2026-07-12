@@ -652,6 +652,67 @@ def test_pmt_web_google_docs_context_csrf_versions_and_safe_rendering(
     assert "Belum ada Google Docs context" in removed.text
 
 
+def test_pmt_web_removes_google_doc_created_context_without_foreign_key_error(client, settings):
+    store = PmtStore(settings.pmt_db_path)
+    created = store.create_task_from_google_doc(
+        TaskInput(title="Created from Google Docs", source="google_docs"),
+        source_url="https://docs.google.com/document/d/doc123/edit?tab=t.0",
+        snapshot=_context_snapshot(),
+        actor="Farhan",
+        idempotency_key="web-remove-created-context",
+    )
+    task = created["task"]
+    document = created["context"]
+    csrf = _login_and_csrf(client, f"/pmt/tasks/{task['task_key']}")
+
+    removed = client.post(
+        f"/pmt/tasks/{task['task_key']}/context/{document['id']}/remove",
+        data={
+            "version": task["version"],
+            "context_version": document["context_version"],
+            "csrf_token": csrf,
+        },
+        follow_redirects=True,
+    )
+
+    assert removed.status_code == 200
+    assert "Belum ada Google Docs context" in removed.text
+    assert (
+        store.get_google_doc_task_creation("web-remove-created-context", document["source_url"])
+        is None
+    )
+
+
+def test_pmt_web_remove_task_requires_exact_confirmation_and_shows_notification(client, settings):
+    store = PmtStore(settings.pmt_db_path)
+    task = store.create_task(TaskInput(title="Mistaken task"), actor="Farhan")
+    csrf = _login_and_csrf(client, f"/pmt/tasks/{task['task_key']}")
+
+    rejected = client.post(
+        f"/pmt/tasks/{task['task_key']}/remove",
+        data={
+            "version": task["version"],
+            "confirm_task_key": "wrong",
+            "csrf_token": csrf,
+        },
+    )
+    assert rejected.status_code == 409
+    assert store.get_task(task["task_key"]) is not None
+
+    removed = client.post(
+        f"/pmt/tasks/{task['task_key']}/remove",
+        data={
+            "version": task["version"],
+            "confirm_task_key": task["task_key"],
+            "csrf_token": csrf,
+        },
+        follow_redirects=True,
+    )
+    assert removed.status_code == 200
+    assert f"{task['task_key']} berhasil dihapus." in removed.text
+    assert store.get_task(task["task_key"]) is None
+
+
 @pytest.mark.parametrize(
     ("csrf_data", "expected_status"),
     [({}, 422), ({"csrf_token": "wrong"}, 403)],

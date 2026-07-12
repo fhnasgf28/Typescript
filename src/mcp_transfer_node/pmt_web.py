@@ -181,6 +181,7 @@ def create_pmt_web_router(
     @router.get("/", response_class=HTMLResponse)
     def dashboard(request: Request, task_status: str | None = None):
         _require_login(request)
+        flash = request.session.pop("pmt_flash", None)
         tasks = store.list_tasks(limit=200)
         initial_status = task_status if task_status in {*KANBAN_STATUSES, "all"} else "todo"
         grouped = {
@@ -204,6 +205,7 @@ def create_pmt_web_router(
                     agent["effective_status"] in {"online", "busy", "draining"} for agent in agents
                 ),
                 "csrf_token": request.session["csrf_token"],
+                "flash": flash,
             },
         )
 
@@ -757,6 +759,40 @@ def create_pmt_web_router(
         return RedirectResponse(
             f"/pmt/tasks/{task_ref}#external-context", status_code=status.HTTP_303_SEE_OTHER
         )
+
+    @router.post("/tasks/{task_ref}/remove")
+    def remove_task(
+        request: Request,
+        task_ref: str,
+        version: int = Form(...),
+        confirm_task_key: str = Form(...),
+        csrf_token: str = Form(...),
+    ) -> RedirectResponse:
+        _require_login(request)
+        _require_csrf(request, csrf_token)
+        task = store.get_task(task_ref)
+        if task is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Task tidak ditemukan")
+        if not secrets.compare_digest(confirm_task_key.strip(), task["task_key"]):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail="Ketik task key secara tepat untuk mengonfirmasi penghapusan",
+            )
+        try:
+            removed = store.remove_task(
+                task_ref,
+                actor=_principal(request),
+                expected_version=version,
+            )
+        except KeyError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Task tidak ditemukan") from exc
+        except (PermissionError, ValueError) as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        request.session["pmt_flash"] = {
+            "message": f"{removed['task_key']} berhasil dihapus.",
+            "tone": "success",
+        }
+        return RedirectResponse("/pmt?task_status=all", status_code=status.HTTP_303_SEE_OTHER)
 
     @router.post("/tasks/{task_ref}/edit")
     def edit_task(
