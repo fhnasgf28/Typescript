@@ -57,6 +57,7 @@ KANBAN_STATUSES = (
     "done",
 )
 
+
 def _kanban_allowed_statuses(task: dict[str, Any]) -> list[str]:
     allowed = set(ADMIN_STATUS_TRANSITIONS.get(task["status"], set()))
     if not task["claimed_by"]:
@@ -183,8 +184,7 @@ def create_pmt_web_router(
         tasks = store.list_tasks(limit=200)
         initial_status = task_status if task_status in {*KANBAN_STATUSES, "all"} else "todo"
         grouped = {
-            name: [task for task in tasks if task["status"] == name]
-            for name in KANBAN_STATUSES
+            name: [task for task in tasks if task["status"] == name] for name in KANBAN_STATUSES
         }
         task_status_transitions = {
             task["task_key"]: _kanban_allowed_statuses(task) for task in tasks
@@ -853,10 +853,13 @@ def create_pmt_web_router(
             )
         except KeyError:
             return JSONResponse(
-                {"ok": False, "error": "Task tidak ditemukan"}, status_code=status.HTTP_404_NOT_FOUND
+                {"ok": False, "error": "Task tidak ditemukan"},
+                status_code=status.HTTP_404_NOT_FOUND,
             )
         except (PermissionError, ValueError) as exc:
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=status.HTTP_409_CONFLICT)
+            return JSONResponse(
+                {"ok": False, "error": str(exc)}, status_code=status.HTTP_409_CONFLICT
+            )
         allowed_statuses = _kanban_allowed_statuses(task)
         return JSONResponse(
             {

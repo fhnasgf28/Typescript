@@ -389,9 +389,9 @@ def test_pmt_dashboard_requires_login_and_can_create_task(client):
     assert 'draggable="true"' in dashboard.text
     assert 'data-task-key="PMT-0001"' in dashboard.text
     assert 'data-allowed-statuses="inbox,ready_for_review,blocked,done"' in dashboard.text
-    assert 'data-created-date' in dashboard.text
+    assert "data-created-date" in dashboard.text
     assert 'class="toast-container position-fixed top-0 end-0' in dashboard.text
-    assert 'data-feedback-message' in dashboard.text
+    assert "data-feedback-message" in dashboard.text
     assert "/pmt/tasks/PMT-0001" in dashboard.text
     assert "/status/kanban" in dashboard.text
     css = client.get("/static/pmt.css?v=20260713-kanban2")

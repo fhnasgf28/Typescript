@@ -193,7 +193,6 @@ def test_manual_status_transition_releases_agent_claim(settings):
     assert released["lease_expires_at"] is None
 
 
-
 def test_manual_status_transition_supports_kanban_destinations(settings):
     store = PmtStore(settings.pmt_db_path)
     store.initialize()
@@ -204,6 +203,7 @@ def test_manual_status_transition_supports_kanban_destinations(settings):
     assert completed["status"] == "done"
     with pytest.raises(ValueError, match="requires an agent owner"):
         store.admin_transition_task(task["task_key"], "in_progress", "web-admin")
+
 
 def test_schedule_claim_and_finish(settings):
     store = PmtStore(settings.pmt_db_path)
