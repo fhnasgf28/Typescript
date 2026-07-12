@@ -383,10 +383,10 @@ def test_pmt_dashboard_requires_login_and_can_create_task(client):
     assert "bootstrap@5.3.3" in dashboard.text
     assert 'id="newTaskModal"' in dashboard.text
     assert 'class="modal-content pmt-modal-form' in dashboard.text
-    assert "/static/pmt.css?v=20260712-sprint2b" in dashboard.text
+    assert "/static/pmt.css?v=20260712-gdocs-reader2" in dashboard.text
     assert 'id="task-search"' in dashboard.text
     assert "/pmt/tasks/PMT-0001" in dashboard.text
-    css = client.get("/static/pmt.css?v=20260712-sprint2b")
+    css = client.get("/static/pmt.css?v=20260712-gdocs-reader2")
     assert "max-height: calc(100dvh - 1.5rem)" in css.text
     assert "overflow-y: auto" in css.text
 

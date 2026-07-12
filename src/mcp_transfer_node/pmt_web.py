@@ -11,6 +11,7 @@ from fastapi.templating import Jinja2Templates
 from mcp_transfer_node.config import TransferSettings
 from mcp_transfer_node.pmt_context import GoogleDocsContextService, GoogleDocsFetcher
 from mcp_transfer_node.pmt_gdocs import read_google_doc
+from mcp_transfer_node.pmt_present import build_bounded_web_context as _bounded_web_context
 from mcp_transfer_node.pmt_sheet import validate_sheet_url
 from mcp_transfer_node.pmt_store import (
     ADMIN_STATUS_TRANSITIONS,
@@ -22,26 +23,6 @@ from mcp_transfer_node.pmt_store import (
 )
 
 TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
-MAX_WEB_CONTEXT_CHARS_PER_DOCUMENT = 20_000
-MAX_WEB_CONTEXT_CHARS_PER_TAB = 5_000
-
-
-def _bounded_web_context(document: dict[str, object]) -> dict[str, object]:
-    """Bound untrusted document text rendered into the server-side task page."""
-    remaining = MAX_WEB_CONTEXT_CHARS_PER_DOCUMENT
-    bounded_tabs: list[dict[str, object]] = []
-    for raw_tab in document.get("tabs", []):
-        tab = dict(raw_tab)
-        text = str(tab.pop("text", ""))
-        allowance = min(MAX_WEB_CONTEXT_CHARS_PER_TAB, remaining)
-        display_text = text[:allowance]
-        remaining -= len(display_text)
-        tab.pop("paragraphs", None)
-        tab.pop("tables", None)
-        tab["display_text"] = display_text
-        tab["display_truncated"] = len(display_text) < len(text)
-        bounded_tabs.append(tab)
-    return {**document, "tabs": bounded_tabs}
 
 
 def _require_login(request: Request) -> None:

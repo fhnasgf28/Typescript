@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="light">
   <title>{{ task.task_key }} · Standalone PMT</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH" crossorigin="anonymous">
-  <link href="/static/pmt.css?v=20260712-sprint2b" rel="stylesheet">
-  <link href="/static/pmt-mobile.css?v=20260712-mobile6" rel="stylesheet">
+  <link href="/static/pmt.css?v=20260712-gdocs-reader2" rel="stylesheet">
+  <link href="/static/pmt-mobile.css?v=20260712-gdocs-reader2" rel="stylesheet">
 </head>
 <body class="pmt-body">
   {% set status_colors = {
@@ -151,35 +151,131 @@
           <div class="alert alert-secondary small">Google Docs reader belum dikonfigurasi oleh server owner. Tidak ada credential path yang ditampilkan.</div>
           {% endif %}
 
-          <div class="d-grid gap-3">
+          {% macro render_context_segments(segments) -%}
+            {%- for segment in segments -%}
+              {%- if segment.url -%}
+                <a href="{{ segment.url }}" target="_blank" rel="noopener noreferrer">{{ segment.text }}</a>
+              {%- else -%}
+                {{ segment.text }}
+              {%- endif -%}
+            {%- endfor -%}
+          {%- endmacro %}
+
+          <div class="d-grid gap-4 pmt-documents">
           {% for document in context_documents %}
-            <details class="border rounded-4 p-3 p-md-4"{% if loop.first %} open{% endif %}>
-              <summary class="fw-semibold pmt-wrap-anywhere">{{ document.title or 'Untitled Google Doc' }} · v{{ document.context_version }}</summary>
-              <div class="row g-2 small mt-2 mb-3">
-                <div class="col-md-6"><span class="text-secondary">Document ID:</span> <code class="pmt-wrap-anywhere">{{ document.external_id }}</code></div>
-                <div class="col-md-6"><span class="text-secondary">Selected tab:</span> <code class="pmt-wrap-anywhere">{{ document.selected_tab_id }}</code></div>
-                <div class="col-md-6"><span class="text-secondary">Revision:</span> <code class="pmt-wrap-anywhere">{{ document.revision_id }}</code></div>
-                <div class="col-md-6"><span class="text-secondary">Snapshot:</span> {{ document.tab_count }} tabs · {{ document.char_count }} chars</div>
-                <div class="col-12"><span class="text-secondary">SHA-256:</span> <code class="pmt-hash pmt-wrap-anywhere">{{ document.content_sha256 }}</code></div>
-                <div class="col-md-6"><span class="text-secondary">Fetched:</span> <span data-datetime="{{ document.fetched_at }}">{{ document.fetched_at }}</span></div>
-                <div class="col-md-6"><span class="text-secondary">Last checked:</span> <span data-datetime="{{ document.last_checked_at }}">{{ document.last_checked_at }}</span></div>
-              </div>
-              <div class="d-flex flex-wrap gap-2 mb-3">
-                <a class="btn btn-sm btn-outline-secondary" href="{{ document.source_url }}" target="_blank" rel="noopener noreferrer">Open source ↗</a>
-                {% if google_docs_configured %}<form method="post" action="/pmt/tasks/{{ task.task_key }}/context/{{ document.id }}/refresh"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="version" value="{{ task.version }}"><input type="hidden" name="context_version" value="{{ document.context_version }}"><button class="btn btn-sm btn-outline-primary" type="submit">Refresh</button></form>{% endif %}
-                <form method="post" action="/pmt/tasks/{{ task.task_key }}/context/{{ document.id }}/remove"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="version" value="{{ task.version }}"><input type="hidden" name="context_version" value="{{ document.context_version }}"><button class="btn btn-sm btn-outline-danger" type="submit">Remove</button></form>
-              </div>
-              <div class="d-grid gap-2">
+            <section class="pmt-doc-card" aria-labelledby="context-title-{{ document.id }}">
+              <header class="pmt-doc-header">
+                <div class="pmt-doc-heading-group">
+                  <div class="pmt-doc-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M8 13h8M8 17h6"/></svg>
+                  </div>
+                  <div class="min-w-0">
+                    <h3 class="pmt-doc-title" id="context-title-{{ document.id }}">{{ document.title or 'Untitled Google Doc' }}</h3>
+                    <div class="pmt-doc-badges">
+                      <span class="pmt-doc-badge">Snapshot v{{ document.context_version }}</span>
+                      <span class="pmt-doc-badge pmt-doc-badge-selected">Selected: {{ document.selected_tab_title or document.selected_tab_id }}</span>
+                    </div>
+                  </div>
+                </div>
+                <div class="pmt-doc-actions" aria-label="Document actions">
+                  <a class="btn btn-sm btn-outline-secondary" href="{{ document.source_url }}" target="_blank" rel="noopener noreferrer">Open source &nearr;</a>
+                  {% if google_docs_configured %}
+                  <form method="post" action="/pmt/tasks/{{ task.task_key }}/context/{{ document.id }}/refresh">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <input type="hidden" name="version" value="{{ task.version }}">
+                    <input type="hidden" name="context_version" value="{{ document.context_version }}">
+                    <button class="btn btn-sm btn-outline-primary" type="submit">Refresh</button>
+                  </form>
+                  {% endif %}
+                  <form method="post" action="/pmt/tasks/{{ task.task_key }}/context/{{ document.id }}/remove">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <input type="hidden" name="version" value="{{ task.version }}">
+                    <input type="hidden" name="context_version" value="{{ document.context_version }}">
+                    <button class="btn btn-sm btn-outline-danger" type="submit">Remove</button>
+                  </form>
+                </div>
+              </header>
+
+              <nav class="pmt-doc-tabs" aria-label="Google Docs tabs">
               {% for tab in document.tabs %}
-                <details class="bg-light border rounded-3 p-3"{% if tab.tab_id == document.selected_tab_id %} open{% endif %}>
-                  <summary class="pmt-wrap-anywhere"><span style="padding-left:{{ tab.depth }}rem">{{ tab.path }}</span>{% if tab.tab_id == document.selected_tab_id %} <span class="badge text-bg-primary">selected</span>{% endif %}</summary>
-                  <div class="small text-secondary mt-2">Tab <code class="pmt-wrap-anywhere">{{ tab.tab_id }}</code> · {{ tab.char_count }} chars</div>
-                  <pre class="pmt-context-content mt-3 mb-0">{{ tab.display_text }}</pre>
-                  {% if tab.display_truncated %}<p class="small text-secondary mt-2 mb-0">Preview dibatasi untuk keamanan dan performa. Gunakan REST/MCP tab pagination untuk membaca bagian berikutnya.</p>{% endif %}
+                <a class="pmt-doc-tab{% if tab.tab_id == document.selected_tab_id %} is-selected{% endif %}"
+                   href="#context-{{ document.id }}-tab-{{ tab.tab_id }}"
+                   {% if tab.tab_id == document.selected_tab_id %}aria-current="page"{% endif %}
+                   style="--tab-depth:{{ tab.depth if tab.depth < 5 else 4 }}">
+                  <span class="pmt-doc-tab-title">{{ tab.title or 'Untitled tab' }}</span>
+                  {% if tab.depth %}<span class="pmt-doc-tab-path">{{ tab.path }}</span>{% endif %}
+                </a>
+              {% endfor %}
+              </nav>
+
+              <details class="pmt-doc-technical">
+                <summary>Detail teknis</summary>
+                <dl class="pmt-doc-technical-grid">
+                  <div><dt>Document ID</dt><dd><code>{{ document.external_id }}</code></dd></div>
+                  <div><dt>Revision ID</dt><dd><code>{{ document.revision_id }}</code></dd></div>
+                  <div><dt>Selected tab ID</dt><dd><code>{{ document.selected_tab_id }}</code></dd></div>
+                  <div><dt>Snapshot</dt><dd>{{ document.tab_count }} tabs &middot; {{ document.char_count }} chars</dd></div>
+                  <div><dt>Fetched</dt><dd data-datetime="{{ document.fetched_at }}">{{ document.fetched_at }}</dd></div>
+                  <div><dt>Last checked</dt><dd data-datetime="{{ document.last_checked_at }}">{{ document.last_checked_at }}</dd></div>
+                  <div class="pmt-doc-tech-wide"><dt>SHA-256</dt><dd><code>{{ document.content_sha256 }}</code></dd></div>
+                </dl>
+              </details>
+
+              <div class="pmt-doc-panels">
+              {% for tab in document.tabs %}
+                <details class="pmt-doc-tab-panel{% if tab.tab_id == document.selected_tab_id %} is-selected{% endif %}"
+                         id="context-{{ document.id }}-tab-{{ tab.tab_id }}"
+                         {% if tab.tab_id == document.selected_tab_id %}open{% endif %}>
+                  <summary>
+                    <span class="pmt-doc-panel-title" style="--tab-depth:{{ tab.depth if tab.depth < 5 else 4 }}">{{ tab.title or 'Untitled tab' }}</span>
+                    <span class="pmt-doc-panel-meta">{{ tab.render_char_count }} chars{% if tab.tab_id == document.selected_tab_id %} &middot; selected{% endif %}</span>
+                  </summary>
+                  <div class="pmt-doc-reader">
+                  {% if tab.render_blocks is defined %}
+                  {% for block in tab.render_blocks %}
+                    {% if block.kind == 'heading' %}
+                    <div class="pmt-doc-content-heading pmt-doc-content-heading-{{ block.level }}" role="heading" aria-level="{{ block.level }}">{{ render_context_segments(block.segments) }}</div>
+                    {% elif block.kind == 'paragraph' %}
+                    <p>{{ render_context_segments(block.segments) }}</p>
+                    {% elif block.kind == 'bullet_list' %}
+                    <ul class="pmt-doc-list">
+                      {% for item in block['items'] %}<li style="--item-depth:{{ item.depth }}">{{ render_context_segments(item.segments) }}</li>{% endfor %}
+                    </ul>
+                    {% elif block.kind == 'ordered_list' %}
+                    <ol class="pmt-doc-list pmt-doc-ordered-list">
+                      {% for item in block['items'] %}<li style="--item-depth:{{ item.depth }}">{{ render_context_segments(item.segments) }}</li>{% endfor %}
+                    </ol>
+                    {% elif block.kind == 'table' %}
+                    <div class="pmt-doc-table-wrap" role="region" aria-label="Document table" tabindex="0">
+                      <table class="pmt-doc-table">
+                        <thead><tr>
+                        {% for cell in block.header %}
+                          <th scope="col">{% for line in cell.lines %}<span class="pmt-doc-cell-line">{{ render_context_segments(line) }}</span>{% endfor %}</th>
+                        {% endfor %}
+                        </tr></thead>
+                        {% if block.rows %}<tbody>
+                        {% for row in block.rows %}<tr>
+                          {% for cell in row %}<td>{% for line in cell.lines %}<span class="pmt-doc-cell-line">{{ render_context_segments(line) }}</span>{% endfor %}</td>{% endfor %}
+                        </tr>{% endfor %}
+                        </tbody>{% endif %}
+                      </table>
+                      {% if block.truncated %}<p class="pmt-doc-table-note">Table preview dibatasi untuk keamanan dan performa.</p>{% endif %}
+                    </div>
+                    {% elif block.kind == 'divider' %}
+                    <div class="pmt-doc-divider">{% if block.label %}<span>{{ block.label }}</span>{% endif %}</div>
+                    {% endif %}
+                  {% else %}
+                    <div class="pmt-doc-empty">Tab ini tidak memiliki konten teks yang dapat dipreview.</div>
+                  {% endfor %}
+                  {% else %}
+                    <div class="pmt-doc-legacy-fallback">{{ tab.display_text }}</div>
+                  {% endif %}
+                  </div>
+                  {% if tab.display_truncated %}<p class="pmt-doc-truncated">Preview dibatasi untuk keamanan dan performa. Gunakan REST/MCP tab pagination untuk membaca bagian berikutnya.</p>{% endif %}
                 </details>
               {% endfor %}
               </div>
-            </details>
+            </section>
           {% else %}
             <div class="pmt-empty">Belum ada Google Docs context yang terlampir.</div>
           {% endfor %}

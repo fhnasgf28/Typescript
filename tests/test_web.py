@@ -117,3 +117,114 @@ def test_web_upload_lists_deletes_and_logs_out(client: TestClient) -> None:
     assert logout.status_code == 303
     assert logout.headers["location"] == "/login"
     assert client.get("/transfer", follow_redirects=False).status_code == 303
+
+
+def test_google_docs_context_renders_safe_semantic_document_reader(client, settings) -> None:
+    from mcp_transfer_node.pmt_gdocs import parse_google_doc_payload
+    from mcp_transfer_node.pmt_store import PmtStore, TaskInput
+
+    def paragraph(
+        text: str,
+        *,
+        style: str = "NORMAL_TEXT",
+        bullet: dict | None = None,
+        link: str | None = None,
+    ) -> dict:
+        text_style = {"link": {"url": link}} if link else {}
+        value = {
+            "elements": [{"textRun": {"content": text + "\n", "textStyle": text_style}}],
+            "paragraphStyle": {"namedStyleType": style},
+        }
+        if bullet is not None:
+            value["bullet"] = bullet
+        return {"paragraph": value}
+
+    table = {
+        "table": {
+            "tableRows": [
+                {
+                    "tableCells": [
+                        {"content": [paragraph("Role")]},
+                        {"content": [paragraph("Access")]},
+                    ]
+                },
+                {
+                    "tableCells": [
+                        {"content": [paragraph("Supervisor"), paragraph("Regional")]},
+                        {"content": [paragraph("<script>alert(1)</script>")]},
+                    ]
+                },
+            ]
+        }
+    }
+    child = {
+        "tabProperties": {
+            "tabId": "child",
+            "title": "Access Right Supervisor",
+            "parentTabId": "root",
+        },
+        "documentTab": {"body": {"content": [paragraph("Selected content")]}},
+        "childTabs": [],
+    }
+    payload = {
+        "documentId": "doc123",
+        "title": "Access Right Fixing",
+        "revisionId": "revision-1",
+        "tabs": [
+            {
+                "tabProperties": {"tabId": "root", "title": "Overview"},
+                "documentTab": {
+                    "body": {
+                        "content": [
+                            paragraph("Access matrix", style="HEADING_2"),
+                            paragraph("Read the specification", link="https://example.test/spec"),
+                            paragraph(
+                                "Review supervisor access",
+                                bullet={"listId": "list-1", "nestingLevel": 0},
+                            ),
+                            paragraph("Unsafe", link="javascript:alert(1)"),
+                            table,
+                        ]
+                    }
+                },
+                "childTabs": [child],
+            }
+        ],
+    }
+
+    store = PmtStore(settings.pmt_db_path)
+    store.initialize()
+    task = store.create_task(TaskInput(title="Docs reader task"), actor="Farhan")
+    snapshot = parse_google_doc_payload(payload, selected_tab_id="child")
+    attached = store.save_task_context_snapshot(
+        task["task_key"],
+        source_url="https://docs.google.com/document/d/doc123/edit?tab=child",
+        snapshot=snapshot,
+        actor="Farhan",
+        operation="attach",
+        expected_version=task["version"],
+    )
+
+    client.post("/login", data={"username": "admin", "password": "admin-password"})
+    response = client.get(f"/pmt/tasks/{task['task_key']}")
+
+    assert response.status_code == 200
+    assert "pmt-doc-content-heading-2" in response.text
+    assert '<table class="pmt-doc-table">' in response.text
+    assert "| Role | Access |" not in response.text
+    assert '<pre class="pmt-context-content"' not in response.text
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in response.text
+    assert "<script>alert(1)</script>" not in response.text
+    assert (
+        'href="https://example.test/spec" target="_blank" rel="noopener noreferrer"'
+        in response.text
+    )
+    assert 'href="javascript:alert(1)"' not in response.text
+    assert 'aria-current="page"' in response.text
+    assert "Access Right Supervisor" in response.text
+    assert "Overview / Access Right Supervisor" in response.text
+    assert "Detail teknis" in response.text
+    assert "pmt-doc-technical-grid" in response.text
+    assert (
+        f'action="/pmt/tasks/{task["task_key"]}/context/{attached["id"]}/remove"' in response.text
+    )

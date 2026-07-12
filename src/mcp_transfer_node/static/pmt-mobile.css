@@ -414,3 +414,87 @@ html {
     box-shadow: 0 6px 18px rgba(28, 39, 61, 0.065);
   }
 }
+
+@media (max-width: 767.98px) {
+  #external-context {
+    padding: 1rem !important;
+  }
+
+  .pmt-doc-card {
+    padding: 1rem 0;
+  }
+
+  .pmt-doc-header {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .pmt-doc-icon {
+    width: 2.4rem;
+    height: 2.4rem;
+  }
+
+  .pmt-doc-title {
+    font-size: 1.05rem;
+  }
+
+  .pmt-doc-actions {
+    display: grid;
+    width: 100%;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .pmt-doc-actions form,
+  .pmt-doc-actions .btn {
+    width: 100%;
+  }
+
+  .pmt-doc-tabs {
+    padding-bottom: 0.75rem;
+  }
+
+  .pmt-doc-tab {
+    min-width: min(15rem, calc(100vw - 4.5rem));
+    flex-basis: min(15rem, calc(100vw - 4.5rem));
+  }
+
+  .pmt-doc-technical-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .pmt-doc-tech-wide {
+    grid-column: auto;
+  }
+
+  .pmt-doc-tab-panel > summary {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .pmt-doc-panel-meta {
+    padding-left: calc(var(--tab-depth, 0) * 0.55rem);
+    white-space: normal;
+  }
+
+  .pmt-doc-reader {
+    padding: 0.25rem 0.85rem 1rem;
+    font-size: 0.84rem;
+    line-height: 1.65;
+  }
+
+  .pmt-doc-content-heading-1 {
+    font-size: 1.3rem;
+  }
+
+  .pmt-doc-content-heading-2 {
+    font-size: 1.15rem;
+  }
+
+  .pmt-doc-table {
+    min-width: 36rem;
+  }
+
+  .pmt-doc-list li {
+    margin-left: calc(var(--item-depth) * 0.65rem);
+  }
+}
