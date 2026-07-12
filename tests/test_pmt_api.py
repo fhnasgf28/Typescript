@@ -43,12 +43,18 @@ def test_pmt_api_create_claim_and_transition(client):
         },
     )
     assert claimed.status_code == 200
-    assert claimed.json()["data"]["task"]["claimed_by"] == "server-a"
+    claimed_task = claimed.json()["data"]["task"]
+    assert claimed_task["claimed_by"] == "server-a"
 
     transitioned = client.post(
         f"/api/v1/pmt/tasks/{task['task_key']}/transition",
         headers=HEADERS,
-        json={"agent_id": "server-a", "status": "in_progress", "note": "Inspecting ACL"},
+        json={
+            "agent_id": "server-a",
+            "run_id": claimed_task["current_run_id"],
+            "status": "in_progress",
+            "note": "Inspecting ACL",
+        },
     )
     assert transitioned.status_code == 200
     assert transitioned.json()["data"]["task"]["status"] == "in_progress"
@@ -59,6 +65,12 @@ def test_pmt_api_create_claim_and_transition(client):
 
 
 def test_pmt_api_task_detail_writes(client):
+    registered = client.post(
+        "/api/v1/pmt/agents/register",
+        headers=HEADERS,
+        json={"agent_id": "server-a", "server_name": "dev-a"},
+    )
+    assert registered.status_code == 200
     created = client.post(
         "/api/v1/pmt/tasks",
         headers=HEADERS,
@@ -124,6 +136,29 @@ def test_pmt_api_rejects_agent_impersonation(client):
     assert response.json()["error"]["code"] == "FORBIDDEN"
 
 
+def test_pmt_api_lists_agents_and_accepts_idle_heartbeat(client):
+    registered = client.post(
+        "/api/v1/pmt/agents/register",
+        headers=HEADERS,
+        json={
+            "agent_id": "server-a",
+            "server_name": "dev-a",
+            "capabilities": ["hmx-code", "pipeline"],
+        },
+    )
+    assert registered.status_code == 200
+
+    heartbeat = client.post("/api/v1/pmt/agents/server-a/heartbeat", headers=HEADERS)
+    listed = client.get("/api/v1/pmt/agents", headers=HEADERS)
+
+    assert heartbeat.status_code == 200
+    assert listed.status_code == 200
+    agent = listed.json()["data"]["agents"][0]
+    assert agent["agent_id"] == "server-a"
+    assert agent["effective_status"] == "online"
+    assert agent["capabilities"] == ["hmx-code", "pipeline"]
+
+
 def test_pmt_api_rejects_detail_write_without_active_ownership(client):
     created = client.post(
         "/api/v1/pmt/tasks", headers=HEADERS, json={"title": "Unclaimed task"}
@@ -157,8 +192,54 @@ def test_pmt_dashboard_requires_login_and_can_create_task(client):
     assert "PMT-0001" in dashboard.text
     assert "bootstrap@5.3.3" in dashboard.text
     assert 'id="newTaskModal"' in dashboard.text
+    assert 'class="modal-content pmt-modal-form' in dashboard.text
+    assert "/static/pmt.css?v=20260712-sprint2a" in dashboard.text
     assert 'id="task-search"' in dashboard.text
     assert "/pmt/tasks/PMT-0001" in dashboard.text
+    css = client.get("/static/pmt.css?v=20260712-sprint2a")
+    assert "max-height: calc(100dvh - 1.5rem)" in css.text
+    assert "overflow-y: auto" in css.text
+
+
+def test_pmt_agent_and_sync_centers_require_login_and_render(client):
+    assert client.get("/pmt/agents", follow_redirects=False).status_code == 303
+    assert client.get("/pmt/sync", follow_redirects=False).status_code == 303
+    client.post("/login", data={"password": "admin-password"})
+    client.post(
+        "/api/v1/pmt/agents/register",
+        headers=HEADERS,
+        json={"agent_id": "server-a", "server_name": "dev-a", "capabilities": ["hmx"]},
+    )
+
+    agents = client.get("/pmt/agents")
+    sync = client.get("/pmt/sync")
+
+    assert agents.status_code == 200
+    assert "Agent Control Center" in agents.text
+    assert "server-a" in agents.text
+    assert sync.status_code == 200
+    assert "Sheet Sync Center" in sync.text
+    assert "PMT tidak menulis kembali" in sync.text
+
+
+def test_pmt_web_can_create_and_pause_read_only_sync(client):
+    client.post("/login", data={"password": "admin-password"})
+    created = client.post(
+        "/pmt/sync/schedules",
+        data={
+            "name": "Farhan To-Do",
+            "csv_url": "https://docs.google.com/spreadsheets/d/example/export?format=csv&gid=0",
+            "interval_minutes": "15",
+            "assignee": "Farhan",
+            "dev_status": "To-Do",
+            "project": "HMX",
+            "target_branch": "Human-Resources",
+        },
+        follow_redirects=True,
+    )
+    assert created.status_code == 200
+    assert "Farhan To-Do" in created.text
+    assert "Enabled" in created.text
 
 
 def test_pmt_task_detail_web_workflow(client, settings):

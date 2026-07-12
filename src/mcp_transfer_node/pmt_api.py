@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from mcp_transfer_node.auth import authenticate_peer
 from mcp_transfer_node.config import AllowedPeer, TransferSettings, load_allowed_peers
-from mcp_transfer_node.pmt_store import PmtStore, TaskInput
+from mcp_transfer_node.pmt_store import LeaseExpiredError, PmtStore, TaskInput
 from mcp_transfer_node.responses import error_response, success_response
 
 logger = logging.getLogger(__name__)
@@ -70,11 +70,13 @@ class TaskClaim(BaseModel):
 
 class TaskHeartbeat(BaseModel):
     agent_id: str = Field(min_length=1, max_length=120)
+    run_id: str = Field(min_length=1, max_length=120)
     lease_seconds: int = Field(default=1800, ge=60, le=7200)
 
 
 class TaskTransition(BaseModel):
     agent_id: str = Field(min_length=1, max_length=120)
+    run_id: str = Field(min_length=1, max_length=120)
     status: str
     note: str = Field(default="", max_length=20_000)
     blocker: str = Field(default="", max_length=20_000)
@@ -143,6 +145,9 @@ def create_pmt_api_router(settings: TransferSettings) -> APIRouter:
         if isinstance(exc, KeyError):
             code = status.HTTP_404_NOT_FOUND
             label = "NOT_FOUND"
+        elif isinstance(exc, LeaseExpiredError):
+            code = status.HTTP_409_CONFLICT
+            label = "LEASE_EXPIRED"
         elif isinstance(exc, PermissionError):
             code = status.HTTP_409_CONFLICT
             label = "CLAIM_CONFLICT"
@@ -301,6 +306,28 @@ def create_pmt_api_router(settings: TransferSettings) -> APIRouter:
             translate_error(exc)
         return success_response({"agent": agent})
 
+    @router.get("/agents")
+    def list_agents(
+        offline_after_seconds: int = Query(default=180, ge=30, le=3600),
+        _: AllowedPeer = Depends(require_agent),
+    ):
+        return success_response(
+            {"agents": store.list_agents(offline_after_seconds=offline_after_seconds)}
+        )
+
+    @router.post("/agents/{agent_id}/heartbeat")
+    def heartbeat_agent(agent_id: str, peer: AllowedPeer = Depends(require_agent)):
+        actor_matches(peer, agent_id)
+        try:
+            agent = store.heartbeat_agent(agent_id)
+        except KeyError as exc:
+            translate_error(exc)
+        return success_response({"agent": agent})
+
+    @router.get("/agents/{agent_id}/events")
+    def get_agent_events(agent_id: str, _: AllowedPeer = Depends(require_agent)):
+        return success_response({"events": store.agent_events(agent_id)})
+
     @router.post("/tasks/{task_ref}/claim")
     def claim_task(task_ref: str, payload: TaskClaim, peer: AllowedPeer = Depends(require_agent)):
         actor_matches(peer, payload.agent_id)
@@ -321,7 +348,12 @@ def create_pmt_api_router(settings: TransferSettings) -> APIRouter:
     ):
         actor_matches(peer, payload.agent_id)
         try:
-            task = store.heartbeat(task_ref, payload.agent_id, payload.lease_seconds)
+            task = store.heartbeat(
+                task_ref,
+                payload.agent_id,
+                payload.run_id,
+                payload.lease_seconds,
+            )
         except (KeyError, PermissionError, ValueError) as exc:
             translate_error(exc)
         return success_response({"task": task})
@@ -335,6 +367,7 @@ def create_pmt_api_router(settings: TransferSettings) -> APIRouter:
             task = store.transition_task(
                 task_ref,
                 payload.agent_id,
+                payload.run_id,
                 payload.status,
                 note=payload.note,
                 blocker=payload.blocker,
@@ -360,6 +393,10 @@ def create_pmt_api_router(settings: TransferSettings) -> APIRouter:
         except ValueError as exc:
             translate_error(exc)
         return success_response({"schedule": schedule})
+
+    @router.get("/schedules/{schedule_id}/runs")
+    def list_schedule_runs(schedule_id: str, _: AllowedPeer = Depends(require_agent)):
+        return success_response({"runs": store.list_schedule_runs(schedule_id=schedule_id)})
 
     @router.post("/schedules/claim-due")
     def claim_due_schedule(payload: ScheduleClaim, peer: AllowedPeer = Depends(require_agent)):

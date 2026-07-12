@@ -27,7 +27,7 @@ MCP transfer command: `/home/fhnasgf/mcp-transfer-node/.venv/bin/mcp-transfer-mc
 
 ## Standalone PMT MVP
 
-After login, open `/pmt` to use the task dashboard. Agent API routes live under `/api/v1/pmt` and use the existing peer bearer-token registry with `X-PMT-Agent` identity binding.
+After login, open `/pmt` for tasks, `/pmt/agents` for heartbeat/capability/lease visibility, and `/pmt/sync` for read-only Google Sheet scheduler observability. Agent API routes live under `/api/v1/pmt` and use the existing peer bearer-token registry with `X-PMT-Agent` identity binding.
 
 Install the remote PMT MCP adapter on each OpenClaw server:
 
@@ -44,7 +44,15 @@ The central schedule worker executes one due job per invocation:
 MCP_PMT_AGENT_ID=pmt-scheduler mcp-pmt-worker
 ```
 
-Current executable schedule type: `google_sheet_sync`, restricted to HTTPS Google Docs CSV URLs and defaulting to Farhan tasks with `Dev Status = To-Do`.
+Executable schedule types are `google_sheet_sync` and `lease_recovery`. Google Sheet sync rejects redirects and non-Google targets, uses source-aware idempotency, defaults to Farhan tasks with `Dev Status = To-Do`, and never writes back.
+
+Create a verified online SQLite backup:
+
+```bash
+mcp-pmt-backup --retention 14
+```
+
+Hardened user service, worker timer, and backup timer templates are under `deploy/systemd/`.
 
 Full architecture, API examples, multi-server setup, security rules, scheduler guidance, HMX workflow, limitations, and roadmap:
 

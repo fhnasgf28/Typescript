@@ -3,13 +3,15 @@ from __future__ import annotations
 import csv
 import io
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 
 from mcp_transfer_node.pmt_store import PmtStore, TaskInput
 
 ALLOWED_SHEET_HOSTS = {"docs.google.com"}
+MAX_SHEET_RESPONSE_BYTES = 5 * 1024 * 1024
+ALLOWED_CSV_CONTENT_TYPES = {"text/csv", "text/plain", "application/octet-stream"}
 HEADER_ALIASES = {
     "developer": ("dev", "developer", "assignee"),
     "status": ("dev status", "developer status"),
@@ -83,6 +85,21 @@ def validate_sheet_url(url: str) -> str:
     return url
 
 
+def sheet_source_id(url: str) -> str:
+    parsed = urlparse(validate_sheet_url(url))
+    parts = [part for part in parsed.path.split("/") if part]
+    try:
+        spreadsheet_id = parts[parts.index("d") + 1]
+    except (ValueError, IndexError) as exc:
+        raise ValueError("sheet URL must contain a spreadsheet ID") from exc
+    if not spreadsheet_id or len(spreadsheet_id) > 200:
+        raise ValueError("invalid spreadsheet ID")
+    gid = parse_qs(parsed.query).get("gid", ["0"])[0]
+    if not gid.isdigit() or len(gid) > 20:
+        raise ValueError("invalid sheet gid")
+    return f"{spreadsheet_id}:{gid}"
+
+
 async def sync_google_sheet(
     store: PmtStore,
     payload: dict[str, Any],
@@ -91,20 +108,33 @@ async def sync_google_sheet(
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> dict[str, Any]:
     url = validate_sheet_url(str(payload.get("csv_url", "")))
+    source_id = sheet_source_id(url)
     assignee = str(payload.get("assignee", "Farhan"))
     dev_status = str(payload.get("dev_status", "To-Do"))
     timeout = float(payload.get("timeout_seconds", 30))
     timeout = max(3, min(timeout, 60))
+    content = bytearray()
     async with httpx.AsyncClient(
-        timeout=timeout, follow_redirects=True, transport=transport
+        timeout=timeout, follow_redirects=False, transport=transport
     ) as client:
-        response = await client.get(url)
-        response.raise_for_status()
-    parsed = parse_google_sheet_tasks(response.text, assignee=assignee, dev_status=dev_status)
+        async with client.stream("GET", url) as response:
+            if response.is_redirect:
+                raise ValueError("sheet redirects are not allowed")
+            response.raise_for_status()
+            validate_sheet_url(str(response.url))
+            content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+            if content_type and content_type not in ALLOWED_CSV_CONTENT_TYPES:
+                raise ValueError("sheet response must be CSV or plain text")
+            async for chunk in response.aiter_bytes():
+                content.extend(chunk)
+                if len(content) > MAX_SHEET_RESPONSE_BYTES:
+                    raise ValueError("sheet response exceeds 5 MB")
+    csv_text = bytes(content).decode("utf-8-sig")
+    parsed = parse_google_sheet_tasks(csv_text, assignee=assignee, dev_status=dev_status)
     imported: list[str] = []
     existing: list[str] = []
     for row in parsed:
-        external_id = f"sheet:{row['sheet_row']}"
+        external_id = f"sheet:{source_id}:row:{row['sheet_row']}"
         before = store.get_external_task("google_sheet", external_id)
         task = store.create_task(
             TaskInput(
@@ -130,4 +160,5 @@ async def sync_google_sheet(
         "imported": imported,
         "already_present": existing,
         "filter": {"assignee": assignee, "dev_status": dev_status},
+        "source_id": source_id,
     }

@@ -7,6 +7,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from mcp_transfer_node.config import TransferSettings
+from mcp_transfer_node.pmt_sheet import validate_sheet_url
 from mcp_transfer_node.pmt_store import (
     ADMIN_STATUS_TRANSITIONS,
     EVIDENCE_TYPES,
@@ -50,11 +51,128 @@ def create_pmt_web_router(settings: TransferSettings) -> APIRouter:
                 "done",
             )
         }
+        agents = store.list_agents()
         return TEMPLATES.TemplateResponse(
             request,
             "pmt_dashboard.html",
-            {"settings": settings, "tasks": tasks, "grouped": grouped},
+            {
+                "settings": settings,
+                "tasks": tasks,
+                "grouped": grouped,
+                "agents": agents,
+                "online_agents": sum(
+                    agent["effective_status"] in {"online", "busy", "draining"} for agent in agents
+                ),
+            },
         )
+
+    @router.get("/agents", response_class=HTMLResponse)
+    def agent_control_center(request: Request):
+        _require_login(request)
+        agents = store.list_agents()
+        return TEMPLATES.TemplateResponse(
+            request,
+            "pmt_agents.html",
+            {
+                "settings": settings,
+                "agents": agents,
+                "counts": {
+                    status_name: sum(agent["effective_status"] == status_name for agent in agents)
+                    for status_name in (
+                        "online",
+                        "busy",
+                        "draining",
+                        "offline",
+                        "disabled",
+                    )
+                },
+            },
+        )
+
+    @router.post("/agents/{agent_id}/mode")
+    def update_agent_mode(
+        request: Request,
+        agent_id: str,
+        mode: str = Form(...),
+    ) -> RedirectResponse:
+        _require_login(request)
+        try:
+            store.set_agent_mode(agent_id, mode, "web-admin")
+        except KeyError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Agent tidak ditemukan") from exc
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        return RedirectResponse("/pmt/agents", status_code=status.HTTP_303_SEE_OTHER)
+
+    @router.post("/agents/reconcile-leases")
+    def reconcile_agent_leases(request: Request) -> RedirectResponse:
+        _require_login(request)
+        store.reconcile_expired_leases("web-admin")
+        return RedirectResponse("/pmt/agents", status_code=status.HTTP_303_SEE_OTHER)
+
+    @router.get("/sync", response_class=HTMLResponse)
+    def sync_center(request: Request):
+        _require_login(request)
+        schedules = [
+            schedule
+            for schedule in store.list_schedules()
+            if schedule["job_type"] == "google_sheet_sync"
+        ]
+        return TEMPLATES.TemplateResponse(
+            request,
+            "pmt_sync.html",
+            {
+                "settings": settings,
+                "schedules": schedules,
+                "runs": store.list_schedule_runs(limit=50),
+            },
+        )
+
+    @router.post("/sync/schedules")
+    def create_sync_schedule(
+        request: Request,
+        name: str = Form(...),
+        csv_url: str = Form(...),
+        interval_minutes: int = Form(default=15),
+        assignee: str = Form(default="Farhan"),
+        dev_status: str = Form(default="To-Do"),
+        project: str = Form(default="HMX"),
+        target_branch: str = Form(default="Human-Resources"),
+    ) -> RedirectResponse:
+        _require_login(request)
+        try:
+            csv_url = validate_sheet_url(csv_url)
+            store.create_schedule(
+                name,
+                "google_sheet_sync",
+                max(1, interval_minutes) * 60,
+                {
+                    "csv_url": csv_url,
+                    "assignee": assignee,
+                    "dev_status": dev_status,
+                    "project": project,
+                    "target_branch": target_branch,
+                },
+                "web-admin",
+            )
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return RedirectResponse("/pmt/sync", status_code=status.HTTP_303_SEE_OTHER)
+
+    @router.post("/sync/schedules/{schedule_id}/toggle")
+    def toggle_sync_schedule(
+        request: Request,
+        schedule_id: str,
+        enabled: bool = Form(...),
+    ) -> RedirectResponse:
+        _require_login(request)
+        try:
+            store.set_schedule_enabled(schedule_id, enabled)
+        except KeyError as exc:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, detail="Schedule tidak ditemukan"
+            ) from exc
+        return RedirectResponse("/pmt/sync", status_code=status.HTTP_303_SEE_OTHER)
 
     @router.post("/tasks")
     def create_task(

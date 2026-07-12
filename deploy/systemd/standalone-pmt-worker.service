@@ -1,0 +1,17 @@
+[Unit]
+Description=Run one due Standalone PMT scheduler job
+After=network-online.target standalone-pmt.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/.openclaw/workspace/projects/mcp-transfer-node
+EnvironmentFile=%h/.config/standalone-pmt/pmt.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=%h/.openclaw/workspace/projects/mcp-transfer-node/.venv/bin/mcp-pmt-worker --worker-id pmt-worker-central
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=-%h/.local/share/standalone-pmt -%h/mcp-transfer

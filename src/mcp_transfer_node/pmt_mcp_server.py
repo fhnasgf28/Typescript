@@ -236,6 +236,22 @@ def pmt_register_agent(
 
 
 @mcp.tool()
+def pmt_get_agents(offline_after_seconds: int = 180) -> dict[str, object]:
+    """List PMT agents with derived liveness, mode, current task, and lease state."""
+    return _request(
+        "GET",
+        "/agents",
+        params={"offline_after_seconds": offline_after_seconds},
+    )
+
+
+@mcp.tool()
+def pmt_agent_heartbeat() -> dict[str, object]:
+    """Refresh idle-agent liveness without requiring a claimed task."""
+    return _request("POST", f"/agents/{_agent_id()}/heartbeat")
+
+
+@mcp.tool()
 def pmt_claim_task(
     task_ref: str, idempotency_key: str, lease_seconds: int = 1800
 ) -> dict[str, object]:
@@ -251,12 +267,19 @@ def pmt_claim_task(
     )
 
 
-def _transition(task_ref: str, target_status: str, note: str = "", blocker: str = ""):
+def _transition(
+    task_ref: str,
+    run_id: str,
+    target_status: str,
+    note: str = "",
+    blocker: str = "",
+):
     return _request(
         "POST",
         f"/tasks/{task_ref}/transition",
         json_body={
             "agent_id": _agent_id(),
+            "run_id": run_id,
             "status": target_status,
             "note": note,
             "blocker": blocker,
@@ -265,49 +288,61 @@ def _transition(task_ref: str, target_status: str, note: str = "", blocker: str 
 
 
 @mcp.tool()
-def pmt_task_heartbeat(task_ref: str, lease_seconds: int = 1800) -> dict[str, object]:
+def pmt_task_heartbeat(task_ref: str, run_id: str, lease_seconds: int = 1800) -> dict[str, object]:
     """Extend the current agent's task lease."""
     return _request(
         "POST",
         f"/tasks/{task_ref}/heartbeat",
-        json_body={"agent_id": _agent_id(), "lease_seconds": lease_seconds},
+        json_body={
+            "agent_id": _agent_id(),
+            "run_id": run_id,
+            "lease_seconds": lease_seconds,
+        },
     )
 
 
 @mcp.tool()
-def pmt_start_task(task_ref: str, note: str = "") -> dict[str, object]:
+def pmt_start_task(task_ref: str, run_id: str, note: str = "") -> dict[str, object]:
     """Move a claimed task to In Progress."""
-    return _transition(task_ref, "in_progress", note)
+    return _transition(task_ref, run_id, "in_progress", note)
 
 
 @mcp.tool()
-def pmt_update_progress(task_ref: str, note: str) -> dict[str, object]:
+def pmt_update_progress(task_ref: str, run_id: str, note: str) -> dict[str, object]:
     """Record current work progress while preserving In Progress status."""
-    return _transition(task_ref, "in_progress", note)
+    return _transition(task_ref, run_id, "in_progress", note)
 
 
 @mcp.tool()
-def pmt_report_blocker(task_ref: str, blocker: str, note: str = "") -> dict[str, object]:
+def pmt_report_blocker(
+    task_ref: str, run_id: str, blocker: str, note: str = ""
+) -> dict[str, object]:
     """Mark an owned task Blocked and preserve its agent lease."""
-    return _transition(task_ref, "blocked", note, blocker)
+    return _transition(task_ref, run_id, "blocked", note, blocker)
 
 
 @mcp.tool()
-def pmt_submit_for_review(task_ref: str, summary: str) -> dict[str, object]:
+def pmt_submit_for_review(task_ref: str, run_id: str, summary: str) -> dict[str, object]:
     """Release an owned task into Ready for Review."""
-    return _transition(task_ref, "ready_for_review", summary)
+    return _transition(task_ref, run_id, "ready_for_review", summary)
 
 
 @mcp.tool()
-def pmt_release_task(task_ref: str, note: str = "") -> dict[str, object]:
+def pmt_release_task(task_ref: str, run_id: str, note: str = "") -> dict[str, object]:
     """Release a claimed task back to To-Do."""
-    return _transition(task_ref, "todo", note)
+    return _transition(task_ref, run_id, "todo", note)
 
 
 @mcp.tool()
 def pmt_get_schedules() -> dict[str, object]:
     """List durable PMT schedules and their latest state."""
     return _request("GET", "/schedules")
+
+
+@mcp.tool()
+def pmt_get_schedule_runs(schedule_id: str) -> dict[str, object]:
+    """List recent durable execution results for one PMT schedule."""
+    return _request("GET", f"/schedules/{schedule_id}/runs")
 
 
 @mcp.tool()

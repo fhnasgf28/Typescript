@@ -22,6 +22,18 @@ TASK_STATUSES = {
 }
 TASK_PRIORITIES = {"low", "normal", "high", "urgent"}
 EVIDENCE_TYPES = {"commit", "merge_request", "pipeline", "screenshot", "video", "test", "note"}
+AGENT_MODES = {"active", "draining", "disabled"}
+AGENT_STATUS_TRANSITIONS = {
+    "claimed": {"in_progress", "blocked", "todo"},
+    "in_progress": {"in_progress", "blocked", "ready_for_review", "todo"},
+    "blocked": {"in_progress", "todo"},
+}
+
+
+class LeaseExpiredError(PermissionError):
+    """Raised when an owner presents a claim whose lease is no longer active."""
+
+
 ADMIN_STATUS_TRANSITIONS = {
     "inbox": {"todo", "cancelled"},
     "todo": {"inbox", "cancelled"},
@@ -146,6 +158,16 @@ class PmtStore:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS agent_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    agent_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    payload TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_agent_events_agent
+                    ON agent_events(agent_id, id);
                 CREATE TABLE IF NOT EXISTS schedules (
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
@@ -156,6 +178,7 @@ class PmtStore:
                     next_run_at TEXT NOT NULL,
                     locked_by TEXT,
                     lock_expires_at TEXT,
+                    current_run_id TEXT,
                     last_run_at TEXT,
                     last_status TEXT,
                     created_at TEXT NOT NULL,
@@ -170,6 +193,10 @@ class PmtStore:
                     finished_at TEXT,
                     result TEXT NOT NULL DEFAULT '{}'
                 );
+                CREATE INDEX IF NOT EXISTS idx_schedule_runs_schedule_started
+                    ON schedule_runs(schedule_id, started_at);
+                CREATE INDEX IF NOT EXISTS idx_schedules_due
+                    ON schedules(enabled, next_run_at);
                 """
             )
             db.execute("BEGIN IMMEDIATE")
@@ -178,6 +205,10 @@ class PmtStore:
                 self._ensure_column(db, "tasks", "commit_ref", "TEXT NOT NULL DEFAULT ''")
                 self._ensure_column(db, "tasks", "mr_url", "TEXT NOT NULL DEFAULT ''")
                 self._ensure_column(db, "tasks", "pipeline_url", "TEXT NOT NULL DEFAULT ''")
+                self._ensure_column(db, "tasks", "current_run_id", "TEXT")
+                self._ensure_column(db, "agents", "mode", "TEXT NOT NULL DEFAULT 'active'")
+                self._ensure_column(db, "schedules", "current_run_id", "TEXT")
+                self._migrate_active_task_runs(db)
             except Exception:
                 db.rollback()
                 raise
@@ -189,6 +220,47 @@ class PmtStore:
         columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
         if column not in columns:
             db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    def _migrate_active_task_runs(self, db: sqlite3.Connection) -> None:
+        active_claims = db.execute(
+            """SELECT id,task_key,claimed_by FROM tasks
+                WHERE claimed_by IS NOT NULL AND current_run_id IS NULL"""
+        ).fetchall()
+        now = iso()
+        for task in active_claims:
+            runs = db.execute(
+                """SELECT id FROM task_runs WHERE task_id=? AND agent_id=?
+                    AND finished_at IS NULL ORDER BY started_at DESC""",
+                (task["id"], task["claimed_by"]),
+            ).fetchall()
+            if len(runs) == 1:
+                db.execute(
+                    "UPDATE tasks SET current_run_id=? WHERE id=?",
+                    (runs[0]["id"], task["id"]),
+                )
+                continue
+            db.execute(
+                """UPDATE task_runs SET status='lease_expired',finished_at=?
+                    WHERE task_id=? AND finished_at IS NULL""",
+                (now, task["id"]),
+            )
+            db.execute(
+                """UPDATE agents SET current_task_id=NULL,status='online',updated_at=?
+                    WHERE agent_id=? AND current_task_id=?""",
+                (now, task["claimed_by"], task["id"]),
+            )
+            db.execute(
+                """UPDATE tasks SET status='todo',claimed_by=NULL,lease_expires_at=NULL,
+                    current_run_id=NULL,version=version+1,updated_at=? WHERE id=?""",
+                (now, task["id"]),
+            )
+            self._event(
+                db,
+                task["id"],
+                "task.legacy_claim_reconciled",
+                "schema-migration",
+                {"prior_agent_id": task["claimed_by"], "unfinished_runs": len(runs)},
+            )
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -256,12 +328,10 @@ class PmtStore:
         if expected_owner is None:
             return
         lease = row["lease_expires_at"]
-        if (
-            row["claimed_by"] != expected_owner
-            or not lease
-            or datetime.fromisoformat(lease) <= utcnow()
-        ):
+        if row["claimed_by"] != expected_owner:
             raise PermissionError("task detail writes require the active task owner")
+        if not lease or datetime.fromisoformat(lease) <= utcnow():
+            raise LeaseExpiredError("task lease expired; reclaim before continuing")
 
     @staticmethod
     def _schedule(row: sqlite3.Row) -> dict[str, Any]:
@@ -281,6 +351,19 @@ class PmtStore:
         db.execute(
             "INSERT INTO task_events(task_id,event_type,actor,payload,created_at) VALUES(?,?,?,?,?)",
             (task_id, event_type, actor, json.dumps(payload or {}), iso()),
+        )
+
+    def _agent_event(
+        self,
+        db: sqlite3.Connection,
+        agent_id: str,
+        event_type: str,
+        actor: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        db.execute(
+            "INSERT INTO agent_events(agent_id,event_type,actor,payload,created_at) VALUES(?,?,?,?,?)",
+            (agent_id, event_type, actor, json.dumps(payload or {}), iso()),
         )
 
     def _next_key(self, db: sqlite3.Connection, prefix: str = "PMT") -> str:
@@ -573,12 +656,13 @@ class PmtStore:
             claimed_by = None if releases else row["claimed_by"]
             lease = None if releases else row["lease_expires_at"]
             db.execute(
-                """UPDATE tasks SET status=?,claimed_by=?,lease_expires_at=?,progress_note=?,
+                """UPDATE tasks SET status=?,claimed_by=?,lease_expires_at=?,current_run_id=?,progress_note=?,
                     blocker=?,version=version+1,updated_at=? WHERE id=?""",
                 (
                     target_status,
                     claimed_by,
                     lease,
+                    None if releases else row["current_run_id"],
                     note.strip(),
                     note.strip() if target_status == "blocked" else "",
                     now,
@@ -675,6 +759,9 @@ class PmtStore:
             raise ValueError("agent_id and server_name are required")
         now = iso()
         with self._transaction() as db:
+            existing = db.execute(
+                "SELECT agent_id FROM agents WHERE agent_id=?", (agent_id,)
+            ).fetchone()
             db.execute(
                 """
                 INSERT INTO agents(agent_id,server_name,capabilities,last_heartbeat_at,created_at,updated_at)
@@ -688,8 +775,115 @@ class PmtStore:
                 """,
                 (agent_id, server_name, json.dumps(capabilities or []), now, now, now),
             )
+            self._agent_event(
+                db,
+                agent_id,
+                "agent.heartbeat" if existing else "agent.registered",
+                agent_id,
+                {"server_name": server_name, "capabilities": capabilities or []},
+            )
             row = db.execute("SELECT * FROM agents WHERE agent_id=?", (agent_id,)).fetchone()
         result = dict(row)
+        result["capabilities"] = json.loads(result["capabilities"])
+        return result
+
+    def heartbeat_agent(self, agent_id: str) -> dict[str, Any]:
+        now = iso()
+        with self._transaction() as db:
+            row = db.execute("SELECT * FROM agents WHERE agent_id=?", (agent_id,)).fetchone()
+            if row is None:
+                raise KeyError(agent_id)
+            status = "busy" if row["current_task_id"] else "online"
+            db.execute(
+                "UPDATE agents SET status=?,last_heartbeat_at=?,updated_at=? WHERE agent_id=?",
+                (status, now, now, agent_id),
+            )
+            self._agent_event(db, agent_id, "agent.heartbeat", agent_id)
+            updated = db.execute("SELECT * FROM agents WHERE agent_id=?", (agent_id,)).fetchone()
+        result = dict(updated)
+        result["capabilities"] = json.loads(result["capabilities"])
+        return result
+
+    def list_agents(self, offline_after_seconds: int = 180) -> list[dict[str, Any]]:
+        offline_after_seconds = max(30, min(offline_after_seconds, 3600))
+        now = utcnow()
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT agents.*,tasks.task_key,tasks.title AS task_title,
+                          tasks.status AS task_status,tasks.lease_expires_at
+                    FROM agents LEFT JOIN tasks ON tasks.id=agents.current_task_id
+                    ORDER BY agents.server_name,agents.agent_id"""
+            ).fetchall()
+        agents: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["capabilities"] = json.loads(item["capabilities"])
+            last_seen = datetime.fromisoformat(item["last_heartbeat_at"])
+            item["last_seen_seconds"] = max(0, int((now - last_seen).total_seconds()))
+            lease = item["lease_expires_at"]
+            item["lease_remaining_seconds"] = (
+                max(0, int((datetime.fromisoformat(lease) - now).total_seconds()))
+                if lease
+                else None
+            )
+            item["current_task"] = (
+                {
+                    "task_key": item.pop("task_key"),
+                    "title": item.pop("task_title"),
+                    "status": item.pop("task_status"),
+                    "lease_expires_at": lease,
+                }
+                if item["current_task_id"]
+                else None
+            )
+            if item["mode"] == "disabled":
+                item["effective_status"] = "disabled"
+            elif item["last_seen_seconds"] > offline_after_seconds:
+                item["effective_status"] = "offline"
+            elif item["current_task_id"]:
+                item["effective_status"] = "busy"
+            elif item["mode"] == "draining":
+                item["effective_status"] = "draining"
+            else:
+                item["effective_status"] = "online"
+            agents.append(item)
+        return agents
+
+    def agent_events(self, agent_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT * FROM agent_events WHERE agent_id=? ORDER BY id DESC LIMIT ?",
+                (agent_id, max(1, min(limit, 200))),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            event = dict(row)
+            event["payload"] = json.loads(event["payload"])
+            result.append(event)
+        return result
+
+    def set_agent_mode(self, agent_id: str, mode: str, actor: str) -> dict[str, Any]:
+        if mode not in AGENT_MODES:
+            raise ValueError(f"invalid agent mode: {mode}")
+        with self._transaction() as db:
+            row = db.execute("SELECT * FROM agents WHERE agent_id=?", (agent_id,)).fetchone()
+            if row is None:
+                raise KeyError(agent_id)
+            if mode == "disabled" and row["current_task_id"]:
+                raise ValueError("busy agent must release its task before being disabled")
+            db.execute(
+                "UPDATE agents SET mode=?,updated_at=? WHERE agent_id=?",
+                (mode, iso(), agent_id),
+            )
+            self._agent_event(
+                db,
+                agent_id,
+                "agent.mode_changed",
+                actor,
+                {"from": row["mode"], "to": mode},
+            )
+            updated = db.execute("SELECT * FROM agents WHERE agent_id=?", (agent_id,)).fetchone()
+        result = dict(updated)
         result["capabilities"] = json.loads(result["capabilities"])
         return result
 
@@ -706,6 +900,11 @@ class PmtStore:
         now = utcnow()
         expires = now + timedelta(seconds=lease_seconds)
         with self._transaction() as db:
+            agent = db.execute("SELECT * FROM agents WHERE agent_id=?", (agent_id,)).fetchone()
+            if agent is None:
+                raise PermissionError("agent must register before claiming a task")
+            if agent["mode"] != "active":
+                raise PermissionError(f"agent cannot claim tasks while mode is {agent['mode']}")
             prior = db.execute(
                 "SELECT task_id,agent_id FROM task_runs WHERE idempotency_key=?",
                 (idempotency_key,),
@@ -715,6 +914,18 @@ class PmtStore:
                 if prior["agent_id"] != agent_id or task_ref not in {row["id"], row["task_key"]}:
                     raise PermissionError("idempotency key belongs to another claim")
                 return self._task(row)
+            if agent["current_task_id"]:
+                current = db.execute(
+                    "SELECT id,task_key,lease_expires_at FROM tasks WHERE id=?",
+                    (agent["current_task_id"],),
+                ).fetchone()
+                if (
+                    current
+                    and current["lease_expires_at"]
+                    and current["lease_expires_at"] > iso(now)
+                ):
+                    raise PermissionError(f"agent already owns active task {current['task_key']}")
+                raise PermissionError("agent has an expired task awaiting lease reconciliation")
             row = db.execute(
                 "SELECT * FROM tasks WHERE id=? OR task_key=?", (task_ref, task_ref)
             ).fetchone()
@@ -726,13 +937,39 @@ class PmtStore:
             )
             if task["claimed_by"] and task["claimed_by"] != agent_id and not lease_expired:
                 raise PermissionError(f"task already claimed by {task['claimed_by']}")
+            if task["claimed_by"] and lease_expired:
+                previous_agent = task["claimed_by"]
+                db.execute(
+                    """UPDATE task_runs SET status='lease_expired',finished_at=?
+                        WHERE id=? AND finished_at IS NULL""",
+                    (now.isoformat(), task["current_run_id"]),
+                )
+                db.execute(
+                    """UPDATE agents SET current_task_id=NULL,status='online',updated_at=?
+                        WHERE agent_id=? AND current_task_id=?""",
+                    (now.isoformat(), previous_agent, task["id"]),
+                )
+                self._event(
+                    db,
+                    task["id"],
+                    "task.lease_expired",
+                    "claim-recovery",
+                    {"agent_id": previous_agent, "expired_at": task["lease_expires_at"]},
+                )
+                self._agent_event(
+                    db,
+                    previous_agent,
+                    "agent.lease_expired",
+                    "claim-recovery",
+                    {"task_key": task["task_key"]},
+                )
             if task["status"] in {"done", "cancelled", "ready_for_review"}:
                 raise ValueError(f"task cannot be claimed from status {task['status']}")
             run_id = f"run_{uuid.uuid4().hex}"
             db.execute(
-                """UPDATE tasks SET status='claimed',claimed_by=?,lease_expires_at=?,
+                """UPDATE tasks SET status='claimed',claimed_by=?,lease_expires_at=?,current_run_id=?,
                     version=version+1,updated_at=? WHERE id=?""",
-                (agent_id, expires.isoformat(), now.isoformat(), task["id"]),
+                (agent_id, expires.isoformat(), run_id, now.isoformat(), task["id"]),
             )
             db.execute(
                 """INSERT INTO task_runs(id,task_id,agent_id,idempotency_key,status,started_at,heartbeat_at)
@@ -759,10 +996,23 @@ class PmtStore:
                 agent_id,
                 {"run_id": run_id, "lease_expires_at": expires.isoformat()},
             )
+            self._agent_event(
+                db,
+                agent_id,
+                "agent.task_claimed",
+                agent_id,
+                {"task_key": task["task_key"], "lease_expires_at": expires.isoformat()},
+            )
             updated = db.execute("SELECT * FROM tasks WHERE id=?", (task["id"],)).fetchone()
             return self._task(updated)
 
-    def heartbeat(self, task_ref: str, agent_id: str, lease_seconds: int = 1800) -> dict[str, Any]:
+    def heartbeat(
+        self,
+        task_ref: str,
+        agent_id: str,
+        run_id: str,
+        lease_seconds: int = 1800,
+    ) -> dict[str, Any]:
         lease_seconds = max(60, min(lease_seconds, 7200))
         now = utcnow()
         expires = now + timedelta(seconds=lease_seconds)
@@ -774,18 +1024,28 @@ class PmtStore:
                 raise KeyError(task_ref)
             if row["claimed_by"] != agent_id:
                 raise PermissionError("agent does not own this task")
+            if not run_id or row["current_run_id"] != run_id:
+                raise PermissionError("task run fencing token is stale")
+            self._require_active_owner(row, agent_id)
             db.execute(
                 "UPDATE tasks SET lease_expires_at=?,updated_at=? WHERE id=?",
                 (expires.isoformat(), now.isoformat(), row["id"]),
             )
             db.execute(
-                """UPDATE task_runs SET heartbeat_at=? WHERE task_id=? AND agent_id=?
+                """UPDATE task_runs SET heartbeat_at=? WHERE id=? AND task_id=? AND agent_id=?
                     AND finished_at IS NULL""",
-                (now.isoformat(), row["id"], agent_id),
+                (now.isoformat(), run_id, row["id"], agent_id),
             )
             db.execute(
                 "UPDATE agents SET last_heartbeat_at=?,updated_at=? WHERE agent_id=?",
                 (now.isoformat(), now.isoformat(), agent_id),
+            )
+            self._agent_event(
+                db,
+                agent_id,
+                "agent.task_heartbeat",
+                agent_id,
+                {"task_key": row["task_key"], "run_id": run_id},
             )
             updated = db.execute("SELECT * FROM tasks WHERE id=?", (row["id"],)).fetchone()
             return self._task(updated)
@@ -794,6 +1054,7 @@ class PmtStore:
         self,
         task_ref: str,
         agent_id: str,
+        run_id: str,
         target_status: str,
         *,
         note: str = "",
@@ -809,26 +1070,33 @@ class PmtStore:
                 raise KeyError(task_ref)
             if row["claimed_by"] != agent_id:
                 raise PermissionError("agent does not own this task")
+            if not run_id or row["current_run_id"] != run_id:
+                raise PermissionError("task run fencing token is stale")
+            self._require_active_owner(row, agent_id)
+            allowed = AGENT_STATUS_TRANSITIONS.get(row["status"], set())
+            if target_status not in allowed:
+                raise ValueError(f"invalid agent transition: {row['status']} -> {target_status}")
             now = iso()
             releases = target_status in {"ready_for_review", "done", "cancelled", "todo"}
             db.execute(
                 """UPDATE tasks SET status=?,progress_note=?,blocker=?,claimed_by=?,
-                    lease_expires_at=?,version=version+1,updated_at=? WHERE id=?""",
+                    lease_expires_at=?,current_run_id=?,version=version+1,updated_at=? WHERE id=?""",
                 (
                     target_status,
                     note.strip(),
                     blocker.strip(),
                     None if releases else agent_id,
                     None if releases else row["lease_expires_at"],
+                    None if releases else run_id,
                     now,
                     row["id"],
                 ),
             )
             if releases:
                 db.execute(
-                    """UPDATE task_runs SET status=?,finished_at=? WHERE task_id=?
+                    """UPDATE task_runs SET status=?,finished_at=? WHERE id=? AND task_id=?
                         AND agent_id=? AND finished_at IS NULL""",
-                    (target_status, now, row["id"], agent_id),
+                    (target_status, now, run_id, row["id"], agent_id),
                 )
                 db.execute(
                     """UPDATE agents SET current_task_id=NULL,status='online',updated_at=?
@@ -842,8 +1110,47 @@ class PmtStore:
                 agent_id,
                 {"note": note, "blocker": blocker},
             )
+            self._agent_event(
+                db,
+                agent_id,
+                f"agent.task_{target_status}",
+                agent_id,
+                {"task_key": row["task_key"]},
+            )
             updated = db.execute("SELECT * FROM tasks WHERE id=?", (row["id"],)).fetchone()
             return self._task(updated)
+
+    def reconcile_expired_leases(self, actor: str = "lease-monitor") -> dict[str, Any]:
+        now = utcnow()
+        released: list[dict[str, str]] = []
+        with self._transaction() as db:
+            rows = db.execute(
+                """SELECT * FROM tasks WHERE claimed_by IS NOT NULL
+                    AND lease_expires_at IS NOT NULL AND lease_expires_at<=?""",
+                (now.isoformat(),),
+            ).fetchall()
+            for row in rows:
+                agent_id = row["claimed_by"]
+                db.execute(
+                    """UPDATE tasks SET status='todo',claimed_by=NULL,lease_expires_at=NULL,current_run_id=NULL,
+                        blocker='',version=version+1,updated_at=? WHERE id=?""",
+                    (now.isoformat(), row["id"]),
+                )
+                db.execute(
+                    """UPDATE task_runs SET status='lease_expired',finished_at=? WHERE id=?
+                        AND task_id=? AND finished_at IS NULL""",
+                    (now.isoformat(), row["current_run_id"], row["id"]),
+                )
+                db.execute(
+                    """UPDATE agents SET current_task_id=NULL,status='online',updated_at=?
+                        WHERE agent_id=? AND current_task_id=?""",
+                    (now.isoformat(), agent_id, row["id"]),
+                )
+                payload = {"task_key": row["task_key"], "expired_at": row["lease_expires_at"]}
+                self._event(db, row["id"], "task.lease_expired", actor, payload)
+                self._agent_event(db, agent_id, "agent.lease_expired", actor, payload)
+                released.append({"task_key": row["task_key"], "agent_id": agent_id})
+        return {"released": released, "count": len(released), "checked_at": now.isoformat()}
 
     def create_schedule(
         self,
@@ -882,6 +1189,54 @@ class PmtStore:
             rows = db.execute("SELECT * FROM schedules ORDER BY created_at").fetchall()
         return [self._schedule(row) for row in rows]
 
+    def list_schedule_runs(
+        self, schedule_id: str | None = None, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        with self._connect() as db:
+            if schedule_id:
+                rows = db.execute(
+                    """SELECT schedule_runs.*,schedules.name,schedules.job_type
+                        FROM schedule_runs JOIN schedules ON schedules.id=schedule_runs.schedule_id
+                        WHERE schedule_id=? ORDER BY started_at DESC LIMIT ?""",
+                    (schedule_id, max(1, min(limit, 200))),
+                ).fetchall()
+            else:
+                rows = db.execute(
+                    """SELECT schedule_runs.*,schedules.name,schedules.job_type
+                        FROM schedule_runs JOIN schedules ON schedules.id=schedule_runs.schedule_id
+                        ORDER BY started_at DESC LIMIT ?""",
+                    (max(1, min(limit, 200)),),
+                ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["result"] = json.loads(item["result"])
+            result.append(item)
+        return result
+
+    def set_schedule_enabled(self, schedule_id: str, enabled: bool) -> dict[str, Any]:
+        with self._transaction() as db:
+            row = db.execute("SELECT * FROM schedules WHERE id=?", (schedule_id,)).fetchone()
+            if row is None:
+                raise KeyError(schedule_id)
+            if not enabled and row["locked_by"]:
+                db.execute(
+                    """UPDATE schedule_runs SET status='cancelled',finished_at=?,result=?
+                        WHERE schedule_id=? AND status='running'""",
+                    (
+                        iso(),
+                        json.dumps({"reason": "schedule disabled by administrator"}),
+                        schedule_id,
+                    ),
+                )
+            db.execute(
+                """UPDATE schedules SET enabled=?,locked_by=NULL,lock_expires_at=NULL,
+                    current_run_id=NULL,updated_at=? WHERE id=?""",
+                (int(enabled), iso(), schedule_id),
+            )
+            updated = db.execute("SELECT * FROM schedules WHERE id=?", (schedule_id,)).fetchone()
+        return self._schedule(updated)
+
     def claim_due_schedule(self, worker_id: str, lease_seconds: int = 300) -> dict[str, Any] | None:
         now = utcnow()
         with self._transaction() as db:
@@ -892,12 +1247,24 @@ class PmtStore:
             ).fetchone()
             if row is None:
                 return None
+            if row["locked_by"]:
+                db.execute(
+                    """UPDATE schedule_runs SET status='timed_out',finished_at=?,result=?
+                        WHERE schedule_id=? AND status='running'""",
+                    (
+                        now.isoformat(),
+                        json.dumps({"reason": "schedule worker lease expired"}),
+                        row["id"],
+                    ),
+                )
             run_id = f"schedule_run_{uuid.uuid4().hex}"
             db.execute(
-                "UPDATE schedules SET locked_by=?,lock_expires_at=?,updated_at=? WHERE id=?",
+                """UPDATE schedules SET locked_by=?,lock_expires_at=?,current_run_id=?,
+                    updated_at=? WHERE id=?""",
                 (
                     worker_id,
                     (now + timedelta(seconds=max(60, lease_seconds))).isoformat(),
+                    run_id,
                     now.isoformat(),
                     row["id"],
                 ),
@@ -925,21 +1292,30 @@ class PmtStore:
                 raise KeyError(schedule_id)
             if row["locked_by"] != worker_id:
                 raise PermissionError("worker does not own this schedule lease")
-            db.execute(
+            if row["current_run_id"] != run_id:
+                raise PermissionError("schedule run fencing token is stale")
+            cursor = db.execute(
                 """UPDATE schedule_runs SET status=?,finished_at=?,result=?
-                    WHERE id=? AND schedule_id=? AND worker_id=?""",
+                    WHERE id=? AND schedule_id=? AND worker_id=? AND status='running'""",
                 (status, now.isoformat(), json.dumps(result), run_id, schedule_id, worker_id),
             )
-            db.execute(
+            if cursor.rowcount != 1:
+                raise PermissionError("schedule run is missing, stale, or already finished")
+            cursor = db.execute(
                 """UPDATE schedules SET locked_by=NULL,lock_expires_at=NULL,last_run_at=?,
-                    last_status=?,next_run_at=?,updated_at=? WHERE id=?""",
+                    current_run_id=NULL,last_status=?,next_run_at=?,updated_at=?
+                    WHERE id=? AND locked_by=? AND current_run_id=?""",
                 (
                     now.isoformat(),
                     status,
                     (now + timedelta(seconds=row["interval_seconds"])).isoformat(),
                     now.isoformat(),
                     schedule_id,
+                    worker_id,
+                    run_id,
                 ),
             )
+            if cursor.rowcount != 1:
+                raise PermissionError("schedule run fencing token is stale")
             updated = db.execute("SELECT * FROM schedules WHERE id=?", (schedule_id,)).fetchone()
             return self._schedule(updated)

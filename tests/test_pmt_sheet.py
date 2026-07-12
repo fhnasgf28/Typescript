@@ -5,6 +5,7 @@ import pytest
 
 from mcp_transfer_node.pmt_sheet import (
     parse_google_sheet_tasks,
+    sheet_source_id,
     sync_google_sheet,
     validate_sheet_url,
 )
@@ -35,6 +36,18 @@ def test_validate_sheet_url_rejects_ssrf_targets():
         validate_sheet_url("https://127.0.0.1/private")
 
 
+def test_sheet_source_id_separates_spreadsheet_and_gid():
+    first = sheet_source_id(
+        "https://docs.google.com/spreadsheets/d/sheet-a/export?format=csv&gid=12"
+    )
+    second = sheet_source_id(
+        "https://docs.google.com/spreadsheets/d/sheet-b/export?format=csv&gid=12"
+    )
+
+    assert first == "sheet-a:12"
+    assert second == "sheet-b:12"
+
+
 @pytest.mark.asyncio
 async def test_sync_google_sheet_imports_once(settings):
     store = PmtStore(settings.pmt_db_path)
@@ -56,3 +69,73 @@ async def test_sync_google_sheet_imports_once(settings):
     assert first["imported"] == ["PMT-0001"]
     assert second["imported"] == []
     assert second["already_present"] == ["PMT-0001"]
+
+
+@pytest.mark.asyncio
+async def test_sync_google_sheet_rejects_redirect_even_from_google(settings):
+    store = PmtStore(settings.pmt_db_path)
+    store.initialize()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            302,
+            headers={"location": "http://127.0.0.1/private"},
+            request=request,
+        )
+
+    with pytest.raises(ValueError, match="redirects are not allowed"):
+        await sync_google_sheet(
+            store,
+            {"csv_url": "https://docs.google.com/spreadsheets/d/example/export?format=csv"},
+            actor="worker",
+            transport=httpx.MockTransport(handler),
+        )
+
+
+@pytest.mark.asyncio
+async def test_sync_google_sheet_rejects_oversized_response(settings):
+    store = PmtStore(settings.pmt_db_path)
+    store.initialize()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=b"x" * (5 * 1024 * 1024 + 1),
+            headers={"content-type": "text/csv"},
+            request=request,
+        )
+
+    with pytest.raises(ValueError, match="exceeds 5 MB"):
+        await sync_google_sheet(
+            store,
+            {"csv_url": "https://docs.google.com/spreadsheets/d/example/export?format=csv"},
+            actor="worker",
+            transport=httpx.MockTransport(handler),
+        )
+
+
+@pytest.mark.asyncio
+async def test_sync_google_sheet_does_not_collide_between_spreadsheets(settings):
+    store = PmtStore(settings.pmt_db_path)
+    store.initialize()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=SHEET_CSV, request=request)
+
+    transport = httpx.MockTransport(handler)
+    first = await sync_google_sheet(
+        store,
+        {"csv_url": "https://docs.google.com/spreadsheets/d/sheet-a/export?format=csv"},
+        actor="worker",
+        transport=transport,
+    )
+    second = await sync_google_sheet(
+        store,
+        {"csv_url": "https://docs.google.com/spreadsheets/d/sheet-b/export?format=csv"},
+        actor="worker",
+        transport=transport,
+    )
+
+    assert first["imported"] == ["PMT-0001"]
+    assert second["imported"] == ["PMT-0002"]
+    assert len(store.list_tasks()) == 2

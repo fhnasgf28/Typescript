@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -53,14 +54,15 @@ def test_owned_task_flow_and_audit_events(settings):
     store.initialize()
     task = store.create_task(TaskInput(title="Employee form"))
     store.register_agent("agent-a", "server-a")
-    store.claim_task(task["task_key"], "agent-a", "claim-flow", 600)
+    claimed = store.claim_task(task["task_key"], "agent-a", "claim-flow", 600)
+    run_id = claimed["current_run_id"]
 
     started = store.transition_task(
-        task["task_key"], "agent-a", "in_progress", note="Inspecting source"
+        task["task_key"], "agent-a", run_id, "in_progress", note="Inspecting source"
     )
-    heartbeat = store.heartbeat(task["task_key"], "agent-a", 900)
+    heartbeat = store.heartbeat(task["task_key"], "agent-a", run_id, 900)
     review = store.transition_task(
-        task["task_key"], "agent-a", "ready_for_review", note="Checks passed"
+        task["task_key"], "agent-a", run_id, "ready_for_review", note="Checks passed"
     )
 
     assert started["status"] == "in_progress"
@@ -200,3 +202,183 @@ def test_schedule_claim_and_finish(settings):
     )
     assert finished["last_status"] == "succeeded"
     assert finished["locked_by"] is None
+
+
+def test_claim_requires_registered_active_agent(settings):
+    store = PmtStore(settings.pmt_db_path)
+    store.initialize()
+    task = store.create_task(TaskInput(title="Guarded claim"))
+
+    with pytest.raises(PermissionError, match="register"):
+        store.claim_task(task["task_key"], "agent-a", "missing-agent", 600)
+
+    store.register_agent("agent-a", "server-a")
+    store.set_agent_mode("agent-a", "draining", "web-admin")
+    with pytest.raises(PermissionError, match="draining"):
+        store.claim_task(task["task_key"], "agent-a", "draining-agent", 600)
+
+
+def test_expired_lease_is_fenced_and_reconciled(settings):
+    store = PmtStore(settings.pmt_db_path)
+    store.initialize()
+    task = store.create_task(TaskInput(title="Expiring task"))
+    store.register_agent("agent-a", "server-a")
+    claimed = store.claim_task(task["task_key"], "agent-a", "expiring-claim", 600)
+    run_id = claimed["current_run_id"]
+    expired_at = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    with store._connect() as db:
+        db.execute(
+            "UPDATE tasks SET lease_expires_at=? WHERE id=?",
+            (expired_at, task["id"]),
+        )
+
+    with pytest.raises(PermissionError, match="lease expired"):
+        store.heartbeat(task["task_key"], "agent-a", run_id, 600)
+    with pytest.raises(PermissionError, match="lease expired"):
+        store.transition_task(task["task_key"], "agent-a", run_id, "in_progress")
+
+    reconciled = store.reconcile_expired_leases()
+    released = store.get_task(task["task_key"])
+    assert reconciled["count"] == 1
+    assert released["status"] == "todo"
+    assert released["claimed_by"] is None
+    assert released["current_run_id"] is None
+    with store._connect() as db:
+        run = db.execute(
+            "SELECT status,finished_at FROM task_runs WHERE id=?", (run_id,)
+        ).fetchone()
+    assert run["status"] == "lease_expired"
+    assert run["finished_at"] is not None
+
+
+def test_stale_run_fencing_token_cannot_mutate_reclaimed_task(settings):
+    store = PmtStore(settings.pmt_db_path)
+    store.initialize()
+    task = store.create_task(TaskInput(title="Fenced task"))
+    store.register_agent("agent-a", "server-a")
+    store.register_agent("agent-b", "server-b")
+    first = store.claim_task(task["task_key"], "agent-a", "first-run", 600)
+    with store._connect() as db:
+        db.execute(
+            "UPDATE tasks SET lease_expires_at=? WHERE id=?",
+            ((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), task["id"]),
+        )
+    second = store.claim_task(task["task_key"], "agent-b", "second-run", 600)
+
+    assert second["current_run_id"] != first["current_run_id"]
+    with pytest.raises(PermissionError):
+        store.heartbeat(task["task_key"], "agent-a", first["current_run_id"], 600)
+    with store._connect() as db:
+        prior = db.execute(
+            "SELECT status,finished_at FROM task_runs WHERE id=?", (first["current_run_id"],)
+        ).fetchone()
+    assert prior["status"] == "lease_expired"
+    assert prior["finished_at"] is not None
+
+
+def test_agent_control_center_derives_status_and_current_task(settings):
+    store = PmtStore(settings.pmt_db_path)
+    store.initialize()
+    task = store.create_task(TaskInput(title="Agent task"))
+    store.register_agent("agent-a", "server-a", ["hmx-code", "pipeline"])
+    store.claim_task(task["task_key"], "agent-a", "agent-center", 600)
+
+    agent = store.list_agents()[0]
+    assert agent["effective_status"] == "busy"
+    assert agent["current_task"]["task_key"] == task["task_key"]
+    assert agent["lease_remaining_seconds"] > 0
+    assert agent["capabilities"] == ["hmx-code", "pipeline"]
+
+
+def test_schedule_finish_rejects_unknown_run(settings):
+    store = PmtStore(settings.pmt_db_path)
+    store.initialize()
+    schedule = store.create_schedule("Sheet sync", "google_sheet_sync", 60, {}, "admin")
+    with store._connect() as db:
+        db.execute(
+            "UPDATE schedules SET next_run_at='2000-01-01T00:00:00+00:00' WHERE id=?",
+            (schedule["id"],),
+        )
+    store.claim_due_schedule("worker-a")
+
+    with pytest.raises(PermissionError, match="fencing token is stale"):
+        store.finish_schedule_run(schedule["id"], "unknown-run", "worker-a", "succeeded", {})
+
+
+def test_expired_schedule_run_is_timed_out_before_reclaim(settings):
+    store = PmtStore(settings.pmt_db_path)
+    store.initialize()
+    schedule = store.create_schedule("Lease recovery", "lease_recovery", 60, {}, "admin")
+    with store._connect() as db:
+        db.execute(
+            "UPDATE schedules SET next_run_at='2000-01-01T00:00:00+00:00' WHERE id=?",
+            (schedule["id"],),
+        )
+    first = store.claim_due_schedule("worker-a", 60)
+    with store._connect() as db:
+        db.execute(
+            "UPDATE schedules SET lock_expires_at='2000-01-01T00:00:00+00:00' WHERE id=?",
+            (schedule["id"],),
+        )
+
+    second = store.claim_due_schedule("worker-b", 60)
+    runs = store.list_schedule_runs(schedule["id"])
+
+    assert first["run_id"] != second["run_id"]
+    assert {run["status"] for run in runs} == {"running", "timed_out"}
+
+
+def test_stale_schedule_run_cannot_finish_after_same_worker_reclaims(settings):
+    store = PmtStore(settings.pmt_db_path)
+    store.initialize()
+    schedule = store.create_schedule("Lease recovery", "lease_recovery", 60, {}, "admin")
+    with store._connect() as db:
+        db.execute(
+            "UPDATE schedules SET next_run_at='2000-01-01T00:00:00+00:00' WHERE id=?",
+            (schedule["id"],),
+        )
+    first = store.claim_due_schedule("worker-a", 60)
+    with store._connect() as db:
+        db.execute(
+            "UPDATE schedules SET lock_expires_at='2000-01-01T00:00:00+00:00' WHERE id=?",
+            (schedule["id"],),
+        )
+    second = store.claim_due_schedule("worker-a", 60)
+
+    with pytest.raises(PermissionError, match="fencing token is stale"):
+        store.finish_schedule_run(schedule["id"], first["run_id"], "worker-a", "succeeded", {})
+
+    current = next(item for item in store.list_schedules() if item["id"] == schedule["id"])
+    assert current["current_run_id"] == second["run_id"]
+    assert current["locked_by"] == "worker-a"
+
+
+def test_initialize_backfills_unambiguous_legacy_active_run(settings):
+    store = PmtStore(settings.pmt_db_path)
+    store.initialize()
+    store.register_agent("agent-a", "server-a", ["code"])
+    task = store.create_task(TaskInput(title="Legacy active task"), actor="admin")
+    claimed = store.claim_task(task["task_key"], "agent-a", "legacy-claim", 600)
+    with store._connect() as db:
+        db.execute("UPDATE tasks SET current_run_id=NULL WHERE id=?", (task["id"],))
+
+    store.initialize()
+
+    migrated = store.get_task(task["task_key"])
+    assert migrated["current_run_id"] == claimed["current_run_id"]
+    assert migrated["claimed_by"] == "agent-a"
+
+
+def test_concurrent_store_initialization_is_safe(settings):
+    stores = [PmtStore(settings.pmt_db_path) for _ in range(6)]
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        list(executor.map(lambda store: store.initialize(), stores))
+
+    with stores[0]._connect() as db:
+        task_columns = {row["name"] for row in db.execute("PRAGMA table_info(tasks)")}
+        agent_columns = {row["name"] for row in db.execute("PRAGMA table_info(agents)")}
+        schedule_columns = {row["name"] for row in db.execute("PRAGMA table_info(schedules)")}
+    assert {"current_run_id", "source_branch", "pipeline_url"} <= task_columns
+    assert "mode" in agent_columns
+    assert "current_run_id" in schedule_columns

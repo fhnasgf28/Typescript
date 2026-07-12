@@ -23,6 +23,8 @@ async def run_once(worker_id: str) -> dict[str, object]:
     try:
         if schedule["job_type"] == "google_sheet_sync":
             result = await sync_google_sheet(store, schedule["payload"], actor=worker_id)
+        elif schedule["job_type"] == "lease_recovery":
+            result = store.reconcile_expired_leases(actor=worker_id)
         else:
             result = {"reason": f"unsupported job type: {schedule['job_type']}"}
             store.finish_schedule_run(schedule["id"], run_id, worker_id, "skipped", result)

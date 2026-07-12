@@ -91,3 +91,61 @@ def test_pmt_mcp_requires_https_for_remote_api(monkeypatch):
         assert "HTTPS" in str(exc)
     else:
         raise AssertionError("insecure non-local API URL was accepted")
+
+
+def test_pmt_mcp_forwards_run_fencing_token(monkeypatch):
+    calls = []
+
+    def fake_request(method, path, *, json_body=None, params=None):
+        calls.append((method, path, json_body, params))
+        return {"task": {"task_key": "PMT-0001"}}
+
+    monkeypatch.setenv("MCP_PMT_AGENT_ID", "openclaw-server-a")
+    monkeypatch.setattr(pmt_mcp_server, "_request", fake_request)
+
+    pmt_mcp_server.pmt_task_heartbeat("PMT-0001", "run-123", 600)
+    pmt_mcp_server.pmt_start_task("PMT-0001", "run-123", "Starting")
+
+    assert calls == [
+        (
+            "POST",
+            "/tasks/PMT-0001/heartbeat",
+            {
+                "agent_id": "openclaw-server-a",
+                "run_id": "run-123",
+                "lease_seconds": 600,
+            },
+            None,
+        ),
+        (
+            "POST",
+            "/tasks/PMT-0001/transition",
+            {
+                "agent_id": "openclaw-server-a",
+                "run_id": "run-123",
+                "status": "in_progress",
+                "note": "Starting",
+                "blocker": "",
+            },
+            None,
+        ),
+    ]
+
+
+def test_pmt_mcp_agent_control_reads_and_heartbeats(monkeypatch):
+    calls = []
+
+    def fake_request(method, path, *, json_body=None, params=None):
+        calls.append((method, path, json_body, params))
+        return {"agents": []}
+
+    monkeypatch.setenv("MCP_PMT_AGENT_ID", "openclaw-server-a")
+    monkeypatch.setattr(pmt_mcp_server, "_request", fake_request)
+
+    pmt_mcp_server.pmt_get_agents(240)
+    pmt_mcp_server.pmt_agent_heartbeat()
+
+    assert calls == [
+        ("GET", "/agents", None, {"offline_after_seconds": 240}),
+        ("POST", "/agents/openclaw-server-a/heartbeat", None, None),
+    ]

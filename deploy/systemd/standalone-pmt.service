@@ -1,0 +1,22 @@
+[Unit]
+Description=Standalone PMT orchestration API and dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.openclaw/workspace/projects/mcp-transfer-node
+EnvironmentFile=%h/.config/standalone-pmt/pmt.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=%h/.openclaw/workspace/projects/mcp-transfer-node/.venv/bin/mcp-transfer-serve
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=-%h/.local/share/standalone-pmt -%h/mcp-transfer
+
+[Install]
+WantedBy=default.target

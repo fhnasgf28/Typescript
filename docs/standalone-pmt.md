@@ -6,11 +6,11 @@ Standalone PMT adds a central task-orchestration layer to MCP Transfer Node. One
 
 The MVP is deliberately small:
 
-- authenticated Web dashboard, task detail, editing, acceptance checklist, evidence, and activity timeline
+- authenticated Web dashboard, responsive task detail, Agent Control Center, Sheet Sync Center, editing, acceptance checklist, evidence, and activity timeline
 - versioned agent REST API
 - remote stdio MCP adapter for each OpenClaw server
 - SQLite persistence with WAL mode
-- atomic task claim, bounded lease, heartbeat, idempotency, and audit events
+- atomic task claim, fenced run token, bounded lease, heartbeat, idempotency, expiry reconciliation, and audit events
 - durable interval schedules with worker leases
 - a bounded Google Sheet `To-Do` importer
 
@@ -52,7 +52,9 @@ todo -> claimed -> in_progress -> ready_for_review
 - idempotency key makes retries safe
 - another agent receives `409 CLAIM_CONFLICT`
 - an expired lease may be reclaimed
-- heartbeat extends the lease
+- the claim response includes `current_run_id`, which is required for heartbeat and transition calls
+- a stale run token cannot mutate a task after it has been reclaimed
+- heartbeat extends only the active fenced run
 
 For the current HMX workflow, use a 30–60 minute lease and heartbeat during long-running verification.
 
@@ -108,7 +110,9 @@ mcp-transfer-serve
 
 Open:
 
-- Web dashboard: `http://127.0.0.1:8787/pmt`
+- Task dashboard: `http://127.0.0.1:8787/pmt`
+- Agent Control Center: `http://127.0.0.1:8787/pmt/agents`
+- Read-only Sheet Sync Center: `http://127.0.0.1:8787/pmt/sync`
 - REST API prefix: `/api/v1/pmt`
 - Existing transfer functions remain available.
 
@@ -118,7 +122,17 @@ Runtime PMT database:
 $MCP_TRANSFER_BASE_DIR/pmt/pmt.sqlite3
 ```
 
-Back up the SQLite database together with its `-wal` and `-shm` files, or use SQLite's online backup command while the service is running.
+Use `mcp-pmt-backup` while the service is running. It uses SQLite's online backup API, runs `PRAGMA integrity_check`, writes a SHA-256 checksum, atomically publishes the backup, and rotates bounded retention. Do not copy only the main database file while WAL mode is active.
+
+### Persistent user service
+
+Hardened user-service templates are available under `deploy/systemd/`:
+
+- `standalone-pmt.service`
+- `standalone-pmt-worker.service` and `.timer`
+- `standalone-pmt-backup.service` and `.timer`
+
+They bind the existing app configuration, use `UMask=0077`, restrict writable paths to `%h/.local/share/standalone-pmt` and the default `%h/mcp-transfer`, poll durable jobs centrally, and create a verified daily backup. If `MCP_TRANSFER_BASE_DIR` points elsewhere, add that exact directory to `ReadWritePaths` before installation. Inspect existing user services first and install these as separate units; do not replace an existing Transfer Node service.
 
 ## Configure each OpenClaw MCP client
 
@@ -157,7 +171,10 @@ Read/context:
 - `pmt_get_my_tasks`
 - `pmt_get_task`
 - `pmt_get_task_context`
+- `pmt_get_agents`
+- `pmt_agent_heartbeat`
 - `pmt_get_schedules`
+- `pmt_get_schedule_runs`
 
 Task writes:
 
@@ -232,12 +249,12 @@ curl --fail-with-body https://pmt.example.com/api/v1/pmt/tasks/PMT-0001/heartbea
   -H "Authorization: Bearer $MCP_PMT_API_TOKEN" \
   -H "X-PMT-Agent: $MCP_PMT_AGENT_ID" \
   -H 'Content-Type: application/json' \
-  -d '{"agent_id":"openclaw-server-a","lease_seconds":1800}'
+  -d '{"agent_id":"openclaw-server-a","run_id":"<current_run_id-from-claim>","lease_seconds":1800}'
 ```
 
 ## Google Sheet schedule
 
-The only executable MVP job type is `google_sheet_sync`. It accepts a public Google Sheet CSV export URL and imports matching rows as idempotent PMT tasks.
+Executable job types are `google_sheet_sync` and `lease_recovery`. Sheet sync accepts a public Google Sheet CSV export URL and imports matching rows as idempotent PMT tasks. Lease recovery releases expired task claims and closes their fenced runs.
 
 Default filters follow the current HMX workflow:
 
@@ -264,9 +281,10 @@ Create the schedule through the API/MCP:
 The importer:
 
 - only accepts HTTPS URLs on `docs.google.com`
+- rejects redirects, oversized responses, and unexpected content types
 - auto-detects a header row within the first 30 CSV rows
 - imports only matching task rows
-- stores `google_sheet + sheet:<row>` as an idempotent external identity
+- stores spreadsheet ID + gid + row as a source-aware idempotent identity
 - does not write back to the Sheet
 
 Run one due schedule:
@@ -281,10 +299,10 @@ Use one system cron or timer on the **central PMT server** to invoke the worker 
 
 1. `pmt_get_available_tasks`
 2. `pmt_get_task_context`
-3. `pmt_claim_task` with a unique idempotency key
+3. `pmt_claim_task` with a unique idempotency key; retain its `current_run_id`
 4. HMX code search and repository inspection
-5. `pmt_start_task`
-6. heartbeat during long tests
+5. `pmt_start_task` with the fenced `run_id`
+6. heartbeat with the same `run_id` during long tests
 7. update progress/blocker
 8. run module, pre-push, access, pipeline, and UI evidence checks as required
 9. `pmt_submit_for_review`
@@ -296,7 +314,7 @@ Use one system cron or timer on the **central PMT server** to invoke the worker 
 - Web login is a single admin password inherited from Transfer Node; use OIDC and RBAC before multi-user/public deployment.
 - Peer identities do not yet have fine-grained scopes.
 - Schedules are interval-based, not full cron expressions.
-- Sheet identity currently includes its row number. A stable source UUID column is recommended before rows are frequently reordered.
+- Sheet identity includes spreadsheet ID, gid, and row number. A stable source UUID column is still recommended before rows are frequently reordered.
 - No attachment upload, webhook receiver, GitLab write, Sheet write-back, notification send, or deployment action is implemented.
 - Approval requests, task dependencies, evidence verdict automation, and sprint analytics remain follow-up modules.
 
