@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, RedirectResponse
 from starlette.middleware.sessions import SessionMiddleware
+from starlette.staticfiles import StaticFiles
 
 from mcp_transfer_node.api import create_api_router
 from mcp_transfer_node.config import TransferSettings, load_settings
@@ -25,6 +27,11 @@ def create_app(settings: TransferSettings | None = None) -> FastAPI:
     configure_logging(resolved.logs_dir)
     app = FastAPI(title="MCP Transfer Node")
     app.add_middleware(SessionMiddleware, secret_key=resolved.session_secret, max_age=12 * 60 * 60)
+    app.mount(
+        "/static",
+        StaticFiles(directory=str(Path(__file__).parent / "static")),
+        name="static",
+    )
 
     @app.exception_handler(HTTPException)
     async def http_exception_handler(_, exc: HTTPException):

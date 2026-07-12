@@ -85,3 +85,6 @@ def test_pmt_dashboard_requires_login_and_can_create_task(client):
     assert dashboard.status_code == 200
     assert "Dashboard task" in dashboard.text
     assert "PMT-0001" in dashboard.text
+    assert "bootstrap@5.3.3" in dashboard.text
+    assert 'id="newTaskModal"' in dashboard.text
+    assert 'id="task-search"' in dashboard.text

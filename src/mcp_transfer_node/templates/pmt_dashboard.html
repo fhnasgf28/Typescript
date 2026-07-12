@@ -3,65 +3,223 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>PMT Dashboard · {{ settings.server_name }}</title>
-  <style>
-    :root{color-scheme:dark;--bg:#09111f;--panel:#111c2f;--line:#293955;--text:#eaf0fb;--muted:#91a2bd;--accent:#6ea8fe;--good:#46d19a;--warn:#f7c760;--danger:#ff7a90}
-    *{box-sizing:border-box} body{margin:0;background:linear-gradient(135deg,#08101d,#101b31);color:var(--text);font:14px/1.45 system-ui,sans-serif}
-    header{display:flex;align-items:center;justify-content:space-between;padding:20px 28px;border-bottom:1px solid var(--line);background:#09111ed9;position:sticky;top:0;z-index:2}
-    h1,h2,h3,p{margin-top:0} a{color:var(--accent)} main{padding:24px;max-width:1600px;margin:auto}.subtitle{color:var(--muted);margin:0}
-    .toolbar{display:flex;gap:12px;align-items:center}.button,button{border:1px solid #3a6db2;background:#245a9c;color:white;border-radius:8px;padding:9px 13px;text-decoration:none;cursor:pointer}
-    .layout{display:grid;grid-template-columns:minmax(260px,360px) 1fr;gap:22px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;box-shadow:0 12px 35px #0003}
-    label{display:block;color:var(--muted);font-size:12px;margin:10px 0 4px}input,textarea,select{width:100%;padding:9px 10px;border:1px solid #344762;border-radius:7px;background:#0b1526;color:var(--text)}textarea{min-height:84px;resize:vertical}
-    .board{display:grid;grid-template-columns:repeat(7,minmax(230px,1fr));gap:14px;overflow-x:auto;padding-bottom:10px}.column{background:#0d1728;border:1px solid var(--line);border-radius:12px;padding:12px;min-height:480px}.column h3{display:flex;justify-content:space-between;text-transform:capitalize}.count{background:#253650;color:#c8d4e8;border-radius:99px;padding:1px 8px}
-    .card{background:#152238;border:1px solid #30425f;border-radius:10px;padding:12px;margin-bottom:10px}.key{color:var(--accent);font-weight:700}.meta{color:var(--muted);font-size:12px;margin-top:8px}.priority-urgent{border-left:4px solid var(--danger)}.priority-high{border-left:4px solid var(--warn)}.priority-normal{border-left:4px solid var(--accent)}.priority-low{border-left:4px solid var(--good)}
-    code{color:#b9d6ff}@media(max-width:900px){.layout{grid-template-columns:1fr}.board{grid-template-columns:repeat(7,240px)}header{align-items:flex-start;gap:10px;flex-direction:column}}
-  </style>
+  <meta name="color-scheme" content="light">
+  <title>Task Dashboard · Standalone PMT</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH" crossorigin="anonymous">
+  <link href="/static/pmt.css" rel="stylesheet">
 </head>
-<body>
-<header>
-  <div><h1>Standalone PMT</h1><p class="subtitle">Task orchestration untuk manusia dan multi-server AI agent</p></div>
-  <div class="toolbar"><a class="button" href="/">Transfer Node</a><form method="post" action="/logout"><button>Logout</button></form></div>
-</header>
-<main>
-  <div class="layout">
-    <aside class="panel">
-      <h2>Tambah task</h2>
-      <form method="post" action="/pmt/tasks">
-        <label>Judul</label><input name="title" required maxlength="300" placeholder="Contoh: Fix access right Employee">
-        <label>Deskripsi</label><textarea name="description" placeholder="Requirement dan konteks"></textarea>
-        <label>Project</label><input name="project" value="HMX">
-        <label>Module</label><input name="module" placeholder="core_hr">
-        <label>Menu / feature</label><input name="menu" placeholder="Employee / Manage Overtime">
-        <label>Assignee</label><input name="assignee" value="Farhan">
-        <label>Priority</label><select name="priority"><option>normal</option><option>high</option><option>urgent</option><option>low</option></select>
-        <label>Target branch</label><input name="target_branch" value="Human-Resources">
-        <p></p><button type="submit">Buat task</button>
-      </form>
-      <hr style="border-color:var(--line);margin:22px 0">
-      <p class="subtitle">Agent API: <code>/api/v1/pmt</code></p>
-      <p class="subtitle">Total task: {{ tasks|length }}</p>
-    </aside>
-    <section>
-      <div class="board">
-        {% for status_name, status_tasks in grouped.items() %}
-        <div class="column">
-          <h3>{{ status_name|replace('_',' ') }} <span class="count">{{ status_tasks|length }}</span></h3>
-          {% for task in status_tasks %}
-          <article class="card priority-{{ task.priority }}">
-            <div class="key">{{ task.task_key }}</div>
-            <strong>{{ task.title }}</strong>
-            {% if task.description %}<p class="meta">{{ task.description|truncate(140) }}</p>{% endif %}
-            <div class="meta">{{ task.project }}{% if task.module %} · {{ task.module }}{% endif %}</div>
-            {% if task.menu %}<div class="meta">{{ task.menu }}</div>{% endif %}
-            <div class="meta">Priority: {{ task.priority }}{% if task.assignee %} · {{ task.assignee }}{% endif %}</div>
-            {% if task.claimed_by %}<div class="meta">Agent: {{ task.claimed_by }}</div>{% endif %}
-          </article>
-          {% else %}<p class="subtitle">Belum ada task</p>{% endfor %}
+<body class="pmt-body">
+  <nav class="navbar pmt-navbar sticky-top py-3">
+    <div class="container-fluid px-3 px-lg-4">
+      <a class="navbar-brand d-flex align-items-center gap-3 m-0" href="/pmt">
+        <span class="pmt-brand-mark">P</span>
+        <span>
+          <span class="d-block fw-bold lh-1">Standalone PMT</span>
+          <small class="pmt-muted fw-normal">{{ settings.server_name }}</small>
+        </span>
+      </a>
+      <div class="d-flex align-items-center gap-2">
+        <span class="d-none d-md-inline-flex align-items-center gap-2 small pmt-muted me-2">
+          <span class="rounded-circle bg-success" style="width:.5rem;height:.5rem"></span>
+          Agent API online
+        </span>
+        <button class="btn pmt-btn-primary fw-semibold px-3" data-bs-toggle="modal" data-bs-target="#newTaskModal" type="button">
+          <span class="me-1">＋</span> Task baru
+        </button>
+        <div class="dropdown">
+          <button class="btn btn-light border rounded-3 px-3" data-bs-toggle="dropdown" type="button" aria-expanded="false">•••</button>
+          <ul class="dropdown-menu dropdown-menu-end shadow-sm">
+            <li><a class="dropdown-item" href="/">Transfer Node</a></li>
+            <li><span class="dropdown-item-text small text-secondary">API: /api/v1/pmt</span></li>
+            <li><hr class="dropdown-divider"></li>
+            <li>
+              <form method="post" action="/logout"><button class="dropdown-item text-danger" type="submit">Logout</button></form>
+            </li>
+          </ul>
         </div>
+      </div>
+    </div>
+  </nav>
+
+  <main class="container-fluid px-3 px-lg-4 py-4">
+    <header class="d-flex flex-column flex-lg-row align-items-lg-end justify-content-between gap-3 mb-4">
+      <div>
+        <span class="pmt-eyebrow">HMX Work Orchestration</span>
+        <h1 class="pmt-page-title display-6 mt-1 mb-2">Task Dashboard</h1>
+        <p class="pmt-muted mb-0">Pantau task, ownership agent, dan progress development dalam satu workspace.</p>
+      </div>
+      <div class="small pmt-muted">Data tersimpan di PMT pusat · Refresh halaman untuk data terbaru</div>
+    </header>
+
+    <section class="row g-3 mb-4" aria-label="Ringkasan task">
+      <div class="col-6 col-lg">
+        <article class="pmt-surface pmt-stat-card p-3 p-lg-4" style="--stat-color:#6366f1">
+          <div class="d-flex align-items-center gap-2 pmt-muted small fw-semibold"><span class="pmt-stat-dot"></span>Total task</div>
+          <div class="pmt-stat-value mt-2">{{ tasks|length }}</div>
+          <div class="small pmt-muted">Seluruh workflow</div>
+        </article>
+      </div>
+      <div class="col-6 col-lg">
+        <article class="pmt-surface pmt-stat-card p-3 p-lg-4" style="--stat-color:#3b82f6">
+          <div class="d-flex align-items-center gap-2 pmt-muted small fw-semibold"><span class="pmt-stat-dot"></span>To-Do</div>
+          <div class="pmt-stat-value mt-2">{{ grouped.todo|length }}</div>
+          <div class="small pmt-muted">Siap diambil agent</div>
+        </article>
+      </div>
+      <div class="col-6 col-lg">
+        <article class="pmt-surface pmt-stat-card p-3 p-lg-4" style="--stat-color:#8b5cf6">
+          <div class="d-flex align-items-center gap-2 pmt-muted small fw-semibold"><span class="pmt-stat-dot"></span>Aktif</div>
+          <div class="pmt-stat-value mt-2">{{ grouped.claimed|length + grouped.in_progress|length }}</div>
+          <div class="small pmt-muted">Claimed / progress</div>
+        </article>
+      </div>
+      <div class="col-6 col-lg">
+        <article class="pmt-surface pmt-stat-card p-3 p-lg-4" style="--stat-color:#ef4444">
+          <div class="d-flex align-items-center gap-2 pmt-muted small fw-semibold"><span class="pmt-stat-dot"></span>Blocked</div>
+          <div class="pmt-stat-value mt-2">{{ grouped.blocked|length }}</div>
+          <div class="small pmt-muted">Butuh perhatian</div>
+        </article>
+      </div>
+      <div class="col-6 col-lg">
+        <article class="pmt-surface pmt-stat-card p-3 p-lg-4" style="--stat-color:#10b981">
+          <div class="d-flex align-items-center gap-2 pmt-muted small fw-semibold"><span class="pmt-stat-dot"></span>Selesai</div>
+          <div class="pmt-stat-value mt-2">{{ grouped.done|length }}</div>
+          <div class="small pmt-muted">Task completed</div>
+        </article>
+      </div>
+    </section>
+
+    <section class="pmt-surface pmt-toolbar p-3 mb-4" aria-label="Filter task">
+      <div class="row g-2 align-items-center">
+        <div class="col-12 col-md">
+          <label class="visually-hidden" for="task-search">Cari task</label>
+          <input class="form-control" id="task-search" type="search" placeholder="Cari key, judul, module, menu, atau agent…">
+        </div>
+        <div class="col-7 col-md-3 col-lg-2">
+          <label class="visually-hidden" for="status-filter">Filter status</label>
+          <select class="form-select" id="status-filter">
+            <option value="all">Semua status</option>
+            {% for status_name in grouped %}<option value="{{ status_name }}">{{ status_name|replace('_', ' ')|title }}</option>{% endfor %}
+          </select>
+        </div>
+        <div class="col-5 col-md-auto">
+          <button class="btn btn-light border rounded-3 w-100 px-3" id="reset-filter" type="button">Reset</button>
+        </div>
+      </div>
+    </section>
+
+    {% set status_colors = {
+      'inbox':'#64748b', 'todo':'#3b82f6', 'claimed':'#8b5cf6',
+      'in_progress':'#f59e0b', 'ready_for_review':'#06b6d4',
+      'blocked':'#ef4444', 'done':'#10b981'
+    } %}
+    <section class="pmt-kanban-wrap" aria-label="Kanban task">
+      <div class="pmt-kanban" id="kanban-board">
+        {% for status_name, status_tasks in grouped.items() %}
+        <section class="pmt-column" data-status="{{ status_name }}">
+          <header class="pmt-column-header">
+            <h2 class="pmt-column-title"><span class="pmt-status-dot" style="--status-color:{{ status_colors[status_name] }}"></span>{{ status_name|replace('_',' ') }}</h2>
+            <span class="pmt-count" data-count>{{ status_tasks|length }}</span>
+          </header>
+          <div class="pmt-task-list">
+            {% for task in status_tasks %}
+            <article class="pmt-task-card pmt-priority-{{ task.priority }}"
+              data-search="{{ task.task_key }} {{ task.title }} {{ task.description }} {{ task.project }} {{ task.module }} {{ task.menu }} {{ task.assignee }} {{ task.claimed_by or '' }}"
+              data-priority="{{ task.priority }}">
+              <div class="d-flex align-items-center justify-content-between gap-2">
+                <span class="pmt-task-key">{{ task.task_key }}</span>
+                <span class="badge rounded-pill text-bg-light border text-secondary fw-semibold">{{ task.priority }}</span>
+              </div>
+              <h3 class="pmt-task-title">{{ task.title }}</h3>
+              {% if task.description %}<p class="pmt-task-description mb-3">{{ task.description }}</p>{% endif %}
+              <div class="d-flex flex-wrap gap-1 mb-2">
+                <span class="pmt-chip">{{ task.project }}</span>
+                {% if task.module %}<span class="pmt-chip">{{ task.module }}</span>{% endif %}
+                {% if task.menu %}<span class="pmt-chip">{{ task.menu }}</span>{% endif %}
+              </div>
+              <div class="d-flex justify-content-between align-items-center gap-2 mt-3 pt-2 border-top">
+                <span class="small pmt-muted text-truncate">{{ task.assignee or 'Unassigned' }}</span>
+                {% if task.claimed_by %}<span class="pmt-chip" title="Agent owner">AI · {{ task.claimed_by }}</span>{% endif %}
+              </div>
+            </article>
+            {% endfor %}
+            <div class="pmt-empty{% if status_tasks %} d-none{% endif %}" data-empty>
+              <div><div class="fs-4 mb-2">○</div>Belum ada task di status ini</div>
+            </div>
+          </div>
+        </section>
         {% endfor %}
       </div>
     </section>
+  </main>
+
+  <div class="modal fade pmt-modal" id="newTaskModal" tabindex="-1" aria-labelledby="newTaskTitle" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered modal-lg modal-dialog-scrollable">
+      <div class="modal-content border-0 rounded-4 shadow-lg">
+        <form method="post" action="/pmt/tasks">
+          <div class="modal-header border-0 px-4 pt-4 pb-2">
+            <div><span class="pmt-eyebrow">Create task</span><h2 class="modal-title pmt-page-title h3 mt-1" id="newTaskTitle">Tambahkan task baru</h2></div>
+            <button class="btn-close" data-bs-dismiss="modal" type="button" aria-label="Tutup"></button>
+          </div>
+          <div class="modal-body px-4 py-3">
+            <div class="mb-3">
+              <label class="form-label fw-semibold" for="task-title">Judul task <span class="text-danger">*</span></label>
+              <input class="form-control form-control-lg" id="task-title" name="title" required maxlength="300" placeholder="Contoh: Fix access right Employee">
+            </div>
+            <div class="mb-3">
+              <label class="form-label fw-semibold" for="task-description">Deskripsi dan requirement</label>
+              <textarea class="form-control" id="task-description" name="description" rows="4" placeholder="Jelaskan masalah, expected result, dan acceptance criteria…"></textarea>
+            </div>
+            <div class="row g-3">
+              <div class="col-md-6"><label class="form-label fw-semibold" for="task-project">Project</label><input class="form-control" id="task-project" name="project" value="HMX"></div>
+              <div class="col-md-6"><label class="form-label fw-semibold" for="task-module">Module</label><input class="form-control" id="task-module" name="module" placeholder="core_hr"></div>
+              <div class="col-md-6"><label class="form-label fw-semibold" for="task-menu">Menu / feature</label><input class="form-control" id="task-menu" name="menu" placeholder="Employee / Manage Overtime"></div>
+              <div class="col-md-6"><label class="form-label fw-semibold" for="task-assignee">Assignee</label><input class="form-control" id="task-assignee" name="assignee" value="Farhan"></div>
+              <div class="col-md-6"><label class="form-label fw-semibold" for="task-priority">Priority</label><select class="form-select" id="task-priority" name="priority"><option value="normal">Normal</option><option value="high">High</option><option value="urgent">Urgent</option><option value="low">Low</option></select></div>
+              <div class="col-md-6"><label class="form-label fw-semibold" for="task-branch">Target branch</label><input class="form-control" id="task-branch" name="target_branch" value="Human-Resources"></div>
+            </div>
+          </div>
+          <div class="modal-footer border-0 px-4 pb-4 pt-2">
+            <button class="btn btn-light border rounded-3" data-bs-dismiss="modal" type="button">Batal</button>
+            <button class="btn pmt-btn-primary fw-semibold px-4" type="submit">Buat task</button>
+          </div>
+        </form>
+      </div>
+    </div>
   </div>
-</main>
+
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js" integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz" crossorigin="anonymous"></script>
+  <script>
+    const search = document.getElementById('task-search');
+    const statusFilter = document.getElementById('status-filter');
+    const reset = document.getElementById('reset-filter');
+    const columns = [...document.querySelectorAll('.pmt-column')];
+
+    function applyFilters() {
+      const query = search.value.trim().toLowerCase();
+      const selectedStatus = statusFilter.value;
+      columns.forEach((column) => {
+        const statusMatches = selectedStatus === 'all' || column.dataset.status === selectedStatus;
+        column.classList.toggle('d-none', !statusMatches);
+        let visible = 0;
+        column.querySelectorAll('.pmt-task-card').forEach((card) => {
+          const matches = !query || card.dataset.search.toLowerCase().includes(query);
+          card.classList.toggle('d-none', !matches);
+          if (matches) visible += 1;
+        });
+        column.querySelector('[data-count]').textContent = visible;
+        column.querySelector('[data-empty]').classList.toggle('d-none', visible !== 0);
+      });
+    }
+
+    search.addEventListener('input', applyFilters);
+    statusFilter.addEventListener('change', applyFilters);
+    reset.addEventListener('click', () => {
+      search.value = '';
+      statusFilter.value = 'all';
+      applyFilters();
+      search.focus();
+    });
+  </script>
 </body>
 </html>

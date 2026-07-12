@@ -7,7 +7,17 @@ def test_login_page_loads(client: TestClient) -> None:
     response = client.get("/login")
 
     assert response.status_code == 200
-    assert "MCP Transfer Node Login" in response.text
+    assert "Standalone PMT" in response.text
+    assert "bootstrap@5.3.3" in response.text
+    assert "/static/pmt.css" in response.text
+
+
+def test_pmt_stylesheet_is_served(client: TestClient) -> None:
+    response = client.get("/static/pmt.css")
+
+    assert response.status_code == 200
+    assert "pmt-kanban" in response.text
+    assert response.headers["content-type"].startswith("text/css")
 
 
 def test_index_requires_login(client: TestClient) -> None:
