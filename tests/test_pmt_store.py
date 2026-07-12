@@ -18,17 +18,17 @@ def git_push_payload() -> dict[str, str]:
     }
 
 
-def test_create_multiple_manual_tasks_and_list_by_priority(settings):
+def test_create_multiple_manual_tasks_lists_newest_first(settings):
     store = PmtStore(settings.pmt_db_path)
     store.initialize()
-    first = store.create_task(TaskInput(title="Normal task"))
-    urgent = store.create_task(TaskInput(title="Urgent task", priority="urgent"))
+    first = store.create_task(TaskInput(title="Older urgent task", priority="urgent"))
+    newest = store.create_task(TaskInput(title="Newest normal task"))
 
     tasks = store.list_tasks(status="todo")
 
     assert first["task_key"] == "PMT-0001"
-    assert urgent["task_key"] == "PMT-0002"
-    assert [task["title"] for task in tasks] == ["Urgent task", "Normal task"]
+    assert newest["task_key"] == "PMT-0002"
+    assert [task["title"] for task in tasks] == ["Newest normal task", "Older urgent task"]
 
 
 def test_external_task_creation_is_idempotent(settings):
@@ -192,6 +192,18 @@ def test_manual_status_transition_releases_agent_claim(settings):
     assert released["claimed_by"] is None
     assert released["lease_expires_at"] is None
 
+
+
+def test_manual_status_transition_supports_kanban_destinations(settings):
+    store = PmtStore(settings.pmt_db_path)
+    store.initialize()
+    task = store.create_task(TaskInput(title="Manual board move"))
+
+    completed = store.admin_transition_task(task["task_key"], "done", "web-admin")
+
+    assert completed["status"] == "done"
+    with pytest.raises(ValueError, match="requires an agent owner"):
+        store.admin_transition_task(task["task_key"], "in_progress", "web-admin")
 
 def test_schedule_claim_and_finish(settings):
     store = PmtStore(settings.pmt_db_path)

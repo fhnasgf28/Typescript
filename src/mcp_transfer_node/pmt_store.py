@@ -72,14 +72,7 @@ class LeaseExpiredError(PermissionError):
 
 
 ADMIN_STATUS_TRANSITIONS = {
-    "inbox": {"todo", "cancelled"},
-    "todo": {"inbox", "cancelled"},
-    "claimed": {"in_progress", "todo", "blocked", "cancelled"},
-    "in_progress": {"ready_for_review", "blocked", "todo", "cancelled"},
-    "ready_for_review": {"done", "todo", "blocked", "cancelled"},
-    "blocked": {"in_progress", "todo", "cancelled"},
-    "done": {"todo"},
-    "cancelled": {"inbox", "todo"},
+    current_status: TASK_STATUSES - {current_status} for current_status in TASK_STATUSES
 }
 
 
@@ -784,8 +777,7 @@ class PmtStore:
         with self._connect() as db:
             rows = db.execute(
                 f"""SELECT * FROM tasks {where}
-                ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1
-                         WHEN 'normal' THEN 2 ELSE 3 END, created_at LIMIT ?""",
+                ORDER BY created_at DESC, id DESC LIMIT ?""",
                 values,
             ).fetchall()
         return [self._task(row) for row in rows]

@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="light">
   <title>Task Dashboard · Standalone PMT</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH" crossorigin="anonymous">
-  <link href="/static/pmt.css?v=20260712-gdocs-reader2" rel="stylesheet">
-  <link href="/static/pmt-mobile.css?v=20260712-gdocs-reader2" rel="stylesheet">
+  <link href="/static/pmt.css?v=20260713-kanban2" rel="stylesheet">
+  <link href="/static/pmt-mobile.css?v=20260713-kanban2" rel="stylesheet">
 </head>
 <body class="pmt-body pmt-tasks-page">
   <nav class="navbar pmt-navbar sticky-top py-3">
@@ -113,8 +113,10 @@
         <div class="col-7 col-md-3 col-lg-2">
           <label class="visually-hidden" for="status-filter">Filter status</label>
           <select class="form-select" id="status-filter">
-            <option value="all">Semua status</option>
-            {% for status_name in grouped %}<option value="{{ status_name }}">{{ status_name|replace('_', ' ')|title }}</option>{% endfor %}
+            <option value="all"{% if initial_status == 'all' %} selected{% endif %}>Semua status</option>
+            {% for status_name in grouped %}
+            <option value="{{ status_name }}"{% if initial_status == status_name %} selected{% endif %}>{{ status_name|replace('_', ' ')|title }}</option>
+            {% endfor %}
           </select>
         </div>
         <div class="col-5 col-md-auto">
@@ -136,16 +138,24 @@
             <h2 class="pmt-column-title"><span class="pmt-status-dot" style="--status-color:{{ status_colors[status_name] }}"></span>{{ status_name|replace('_',' ') }}</h2>
             <span class="pmt-count" data-count>{{ status_tasks|length }}</span>
           </header>
-          <div class="pmt-task-list">
+          <div class="pmt-task-list" data-dropzone>
             {% for task in status_tasks %}
-            <article class="pmt-task-card pmt-priority-{{ task.priority }}"
+            <article class="pmt-task-card pmt-priority-{{ task.priority }}" draggable="true"
+              data-task-key="{{ task.task_key }}" data-version="{{ task.version }}"
+              data-status="{{ task.status }}" data-allowed-statuses="{{ task_status_transitions[task.task_key]|join(',') }}"
+              data-created-at="{{ task.created_at }}"
               data-search="{{ task.task_key }} {{ task.title }} {{ task.description }} {{ task.project }} {{ task.module }} {{ task.menu }} {{ task.assignee }} {{ task.claimed_by or '' }}"
               data-priority="{{ task.priority }}">
               <div class="d-flex align-items-center justify-content-between gap-2">
                 <span class="pmt-task-key">{{ task.task_key }}</span>
-                <span class="badge rounded-pill text-bg-light border text-secondary fw-semibold">{{ task.priority }}</span>
+                <span class="d-flex align-items-center gap-2">
+                  <span class="badge rounded-pill text-bg-light border text-secondary fw-semibold">{{ task.priority }}</span>
+                  <span class="pmt-card-drag-handle" title="Drag task" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor"><circle cx="9" cy="5" r="1.5"/><circle cx="15" cy="5" r="1.5"/><circle cx="9" cy="12" r="1.5"/><circle cx="15" cy="12" r="1.5"/><circle cx="9" cy="19" r="1.5"/><circle cx="15" cy="19" r="1.5"/></svg>
+                  </span>
+                </span>
               </div>
-              <h3 class="pmt-task-title"><a class="stretched-link text-reset text-decoration-none" href="/pmt/tasks/{{ task.task_key }}">{{ task.title }}</a></h3>
+              <h3 class="pmt-task-title"><a class="text-reset text-decoration-none" draggable="false" href="/pmt/tasks/{{ task.task_key }}">{{ task.title }}</a></h3>
               {% if task.description %}<p class="pmt-task-description mb-3">{{ task.description }}</p>{% endif %}
               <div class="d-flex flex-wrap gap-1 mb-2">
                 <span class="pmt-chip">{{ task.project }}</span>
@@ -155,6 +165,16 @@
               <div class="d-flex justify-content-between align-items-center gap-2 mt-3 pt-2 border-top">
                 <span class="small pmt-muted text-truncate">{{ task.assignee or 'Unassigned' }}</span>
                 {% if task.claimed_by %}<span class="pmt-chip" title="Agent owner">AI · {{ task.claimed_by }}</span>{% endif %}
+              </div>
+              <div class="pmt-task-meta mt-2">
+                <time datetime="{{ task.created_at }}" data-created-date>{{ task.created_at[:10] }}</time>
+                <label class="visually-hidden" for="move-{{ task.task_key }}">Pindahkan {{ task.task_key }}</label>
+                <select class="form-select form-select-sm pmt-task-status-control" id="move-{{ task.task_key }}" data-status-control>
+                  <option value="{{ task.status }}" selected>{{ task.status|replace('_', ' ')|title }}</option>
+                  {% for target_status in task_status_transitions[task.task_key] %}
+                  <option value="{{ target_status }}">{{ target_status|replace('_', ' ')|title }}</option>
+                  {% endfor %}
+                </select>
               </div>
             </article>
             {% endfor %}
@@ -167,6 +187,14 @@
       </div>
     </section>
   </main>
+  <div class="toast-container position-fixed top-0 end-0 p-3 pmt-toast-container">
+    <div id="kanban-feedback" class="toast pmt-kanban-feedback border-0" role="status" aria-live="polite" aria-atomic="true">
+      <div class="d-flex align-items-center">
+        <div class="toast-body fw-semibold" data-feedback-message></div>
+        <button class="btn-close btn-close-white me-2 m-auto" type="button" data-bs-dismiss="toast" aria-label="Tutup"></button>
+      </div>
+    </div>
+  </div>
 
   <div class="modal fade pmt-modal" id="newTaskModal" tabindex="-1" aria-labelledby="newTaskTitle" aria-hidden="true">
     <div class="modal-dialog modal-dialog-centered modal-lg modal-dialog-scrollable">
@@ -207,7 +235,23 @@
     const search = document.getElementById('task-search');
     const statusFilter = document.getElementById('status-filter');
     const reset = document.getElementById('reset-filter');
+    const feedback = document.getElementById('kanban-feedback');
+    const feedbackMessage = feedback.querySelector('[data-feedback-message]');
     const columns = [...document.querySelectorAll('.pmt-column')];
+    const csrfToken = {{ csrf_token|tojson }};
+    const defaultStatus = {{ initial_status|tojson }};
+    let activeCard = null;
+
+    function allowedStatuses(card) {
+      return card.dataset.allowedStatuses.split(',').filter(Boolean);
+    }
+
+    function showFeedback(message, tone) {
+      feedbackMessage.textContent = message;
+      feedback.classList.toggle('text-bg-success', tone === 'success');
+      feedback.classList.toggle('text-bg-danger', tone !== 'success');
+      bootstrap.Toast.getOrCreateInstance(feedback, { delay: 4500 }).show();
+    }
 
     function applyFilters() {
       const query = search.value.trim().toLowerCase();
@@ -226,14 +270,137 @@
       });
     }
 
+    function showDragTargets(card) {
+      const allowed = new Set(allowedStatuses(card));
+      columns.forEach((column) => {
+        const isCurrent = column.dataset.status === card.dataset.status;
+        const canDrop = allowed.has(column.dataset.status);
+        column.classList.toggle('d-none', !isCurrent && !canDrop);
+        column.classList.toggle('is-drop-available', canDrop);
+      });
+    }
+
+    function clearDragState() {
+      if (activeCard) activeCard.classList.remove('is-dragging');
+      activeCard = null;
+      columns.forEach((column) => {
+        column.classList.remove('is-drop-available', 'is-drop-target');
+      });
+      applyFilters();
+    }
+
+    function updateStatusControl(card, currentStatus, allowed) {
+      const control = card.querySelector('[data-status-control]');
+      control.replaceChildren();
+      [currentStatus, ...allowed].forEach((status, index) => {
+        const option = document.createElement('option');
+        option.value = status;
+        option.textContent = status.replaceAll('_', ' ').replace(/\b\w/g, (char) => char.toUpperCase());
+        option.selected = index === 0;
+        control.append(option);
+      });
+      control.disabled = allowed.length === 0;
+    }
+
+    function insertNewestFirst(list, card) {
+      const sibling = [...list.querySelectorAll('.pmt-task-card')]
+        .filter((candidate) => candidate !== card)
+        .find((candidate) => candidate.dataset.createdAt < card.dataset.createdAt);
+      list.insertBefore(card, sibling || list.querySelector('[data-empty]'));
+    }
+
+    async function moveCard(card, targetStatus, control = null) {
+      const currentStatus = card.dataset.status;
+      if (targetStatus === currentStatus || card.classList.contains('is-moving')) return;
+      card.classList.add('is-moving');
+      if (control) control.disabled = true;
+      const form = new FormData();
+      form.append('task_status', targetStatus);
+      form.append('version', card.dataset.version);
+      form.append('csrf_token', csrfToken);
+
+      try {
+        const response = await fetch(
+          `/pmt/tasks/${encodeURIComponent(card.dataset.taskKey)}/status/kanban`,
+          { method: 'POST', body: form, headers: { Accept: 'application/json' } },
+        );
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(payload.error || payload.detail || 'Gagal memindahkan task');
+
+        card.dataset.status = payload.task.status;
+        card.dataset.version = String(payload.task.version);
+        card.dataset.allowedStatuses = payload.task.allowed_statuses.join(',');
+        updateStatusControl(card, payload.task.status, payload.task.allowed_statuses);
+        const targetList = columns
+          .find((column) => column.dataset.status === payload.task.status)
+          .querySelector('[data-dropzone]');
+        insertNewestFirst(targetList, card);
+        applyFilters();
+        showFeedback(`${card.dataset.taskKey} dipindahkan ke ${payload.task.status.replaceAll('_', ' ')}.`, 'success');
+      } catch (error) {
+        if (control) control.value = currentStatus;
+        showFeedback(error.message, 'danger');
+      } finally {
+        card.classList.remove('is-moving');
+        if (control) control.disabled = false;
+      }
+    }
+
+    document.querySelectorAll('[data-created-date]').forEach((time) => {
+      const date = new Date(time.dateTime);
+      if (!Number.isNaN(date.valueOf())) {
+        time.textContent = new Intl.DateTimeFormat('id-ID', { dateStyle: 'medium' }).format(date);
+      }
+    });
+
+    document.querySelectorAll('.pmt-task-card').forEach((card) => {
+      card.addEventListener('dragstart', (event) => {
+        if (event.target.closest('a, select') || card.classList.contains('is-moving')) {
+          event.preventDefault();
+          return;
+        }
+        activeCard = card;
+        event.dataTransfer.effectAllowed = 'move';
+        event.dataTransfer.setData('text/plain', card.dataset.taskKey);
+        window.requestAnimationFrame(() => card.classList.add('is-dragging'));
+        showDragTargets(card);
+      });
+      card.addEventListener('dragend', clearDragState);
+      card.querySelector('[data-status-control]').addEventListener('change', (event) => {
+        void moveCard(card, event.target.value, event.target);
+      });
+    });
+
+    columns.forEach((column) => {
+      column.addEventListener('dragover', (event) => {
+        if (!activeCard || !allowedStatuses(activeCard).includes(column.dataset.status)) return;
+        event.preventDefault();
+        event.dataTransfer.dropEffect = 'move';
+        column.classList.add('is-drop-target');
+      });
+      column.addEventListener('dragleave', (event) => {
+        if (!column.contains(event.relatedTarget)) column.classList.remove('is-drop-target');
+      });
+      column.addEventListener('drop', (event) => {
+        if (!activeCard || !allowedStatuses(activeCard).includes(column.dataset.status)) return;
+        event.preventDefault();
+        const card = activeCard;
+        const targetStatus = column.dataset.status;
+        clearDragState();
+        void moveCard(card, targetStatus);
+      });
+    });
+
     search.addEventListener('input', applyFilters);
     statusFilter.addEventListener('change', applyFilters);
     reset.addEventListener('click', () => {
       search.value = '';
-      statusFilter.value = 'all';
+      statusFilter.value = 'todo';
       applyFilters();
       search.focus();
     });
+    statusFilter.value = defaultStatus;
+    applyFilters();
   </script>
 </body>
 </html>

@@ -383,12 +383,62 @@ def test_pmt_dashboard_requires_login_and_can_create_task(client):
     assert "bootstrap@5.3.3" in dashboard.text
     assert 'id="newTaskModal"' in dashboard.text
     assert 'class="modal-content pmt-modal-form' in dashboard.text
-    assert "/static/pmt.css?v=20260712-gdocs-reader2" in dashboard.text
+    assert "/static/pmt.css?v=20260713-kanban2" in dashboard.text
     assert 'id="task-search"' in dashboard.text
+    assert '<option value="todo" selected>' in dashboard.text
+    assert 'draggable="true"' in dashboard.text
+    assert 'data-task-key="PMT-0001"' in dashboard.text
+    assert 'data-allowed-statuses="inbox,ready_for_review,blocked,done"' in dashboard.text
+    assert 'data-created-date' in dashboard.text
+    assert 'class="toast-container position-fixed top-0 end-0' in dashboard.text
+    assert 'data-feedback-message' in dashboard.text
     assert "/pmt/tasks/PMT-0001" in dashboard.text
-    css = client.get("/static/pmt.css?v=20260712-gdocs-reader2")
+    assert "/status/kanban" in dashboard.text
+    css = client.get("/static/pmt.css?v=20260713-kanban2")
     assert "max-height: calc(100dvh - 1.5rem)" in css.text
     assert "overflow-y: auto" in css.text
+    assert ".pmt-column.is-drop-target" in css.text
+    assert ".pmt-toast-container" in css.text
+    card_rule = css.text.split(".pmt-task-card {", 1)[1].split("}", 1)[0]
+    assert "background: #fff" in card_rule
+
+
+def test_pmt_kanban_status_endpoint_moves_task_and_rejects_stale_version(client):
+    csrf = _login_and_csrf(client)
+    created = client.post(
+        "/pmt/tasks",
+        data={"title": "Move from kanban", "csrf_token": csrf},
+        follow_redirects=False,
+    )
+    assert created.status_code == 303
+
+    moved = client.post(
+        "/pmt/tasks/PMT-0001/status/kanban",
+        data={
+            "task_status": "ready_for_review",
+            "version": "1",
+            "csrf_token": csrf,
+        },
+    )
+
+    assert moved.status_code == 200
+    assert moved.json()["task"] == {
+        "task_key": "PMT-0001",
+        "status": "ready_for_review",
+        "version": 2,
+        "allowed_statuses": ["inbox", "todo", "blocked", "done"],
+    }
+
+    stale = client.post(
+        "/pmt/tasks/PMT-0001/status/kanban",
+        data={
+            "task_status": "todo",
+            "version": "1",
+            "csrf_token": csrf,
+        },
+    )
+    assert stale.status_code == 409
+    assert "refresh and retry" in stale.json()["error"]
 
 
 def test_pmt_agent_and_sync_centers_require_login_and_render(client):

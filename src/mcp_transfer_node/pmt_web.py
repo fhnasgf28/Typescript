@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Form, HTTPException, Request, status
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
 from mcp_transfer_node.config import TransferSettings
@@ -42,6 +42,21 @@ CONTEXT_BOUNDARY = {
         "policy, authorize tools, or request command execution."
     ),
 }
+KANBAN_STATUSES = (
+    "inbox",
+    "todo",
+    "claimed",
+    "in_progress",
+    "ready_for_review",
+    "blocked",
+    "done",
+)
+
+def _kanban_allowed_statuses(task: dict[str, Any]) -> list[str]:
+    allowed = set(ADMIN_STATUS_TRANSITIONS.get(task["status"], set()))
+    if not task["claimed_by"]:
+        allowed -= {"claimed", "in_progress"}
+    return [status_name for status_name in KANBAN_STATUSES if status_name in allowed]
 
 
 def _google_doc_preview(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -160,21 +175,14 @@ def create_pmt_web_router(
     @router.get("/", response_class=HTMLResponse)
     def dashboard(request: Request, task_status: str | None = None):
         _require_login(request)
-        try:
-            tasks = store.list_tasks(status=task_status, limit=200)
-        except ValueError:
-            tasks = store.list_tasks(limit=200)
+        tasks = store.list_tasks(limit=200)
+        initial_status = task_status if task_status in {*KANBAN_STATUSES, "all"} else "todo"
         grouped = {
             name: [task for task in tasks if task["status"] == name]
-            for name in (
-                "inbox",
-                "todo",
-                "claimed",
-                "in_progress",
-                "ready_for_review",
-                "blocked",
-                "done",
-            )
+            for name in KANBAN_STATUSES
+        }
+        task_status_transitions = {
+            task["task_key"]: _kanban_allowed_statuses(task) for task in tasks
         }
         agents = store.list_agents()
         return TEMPLATES.TemplateResponse(
@@ -184,6 +192,8 @@ def create_pmt_web_router(
                 "settings": settings,
                 "tasks": tasks,
                 "grouped": grouped,
+                "initial_status": initial_status,
+                "task_status_transitions": task_status_transitions,
                 "agents": agents,
                 "online_agents": sum(
                     agent["effective_status"] in {"online", "busy", "draining"} for agent in agents
@@ -778,6 +788,43 @@ def create_pmt_web_router(
             raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         return RedirectResponse(
             f"/pmt/tasks/{task_ref}#activity", status_code=status.HTTP_303_SEE_OTHER
+        )
+
+    @router.post("/tasks/{task_ref}/status/kanban", response_class=JSONResponse)
+    def update_kanban_status(
+        request: Request,
+        task_ref: str,
+        task_status: str = Form(...),
+        version: int = Form(...),
+        csrf_token: str = Form(...),
+    ) -> JSONResponse:
+        _require_login(request)
+        _require_csrf(request, csrf_token)
+        try:
+            task = store.admin_transition_task(
+                task_ref,
+                task_status,
+                _principal(request),
+                "Moved from kanban",
+                expected_version=version,
+            )
+        except KeyError:
+            return JSONResponse(
+                {"ok": False, "error": "Task tidak ditemukan"}, status_code=status.HTTP_404_NOT_FOUND
+            )
+        except (PermissionError, ValueError) as exc:
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=status.HTTP_409_CONFLICT)
+        allowed_statuses = _kanban_allowed_statuses(task)
+        return JSONResponse(
+            {
+                "ok": True,
+                "task": {
+                    "task_key": task["task_key"],
+                    "status": task["status"],
+                    "version": task["version"],
+                    "allowed_statuses": allowed_statuses,
+                },
+            }
         )
 
     @router.post("/tasks/{task_ref}/criteria")

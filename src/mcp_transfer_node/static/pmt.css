@@ -159,6 +159,17 @@ body.pmt-body {
   background: #eef2f8;
   border: 1px solid #e1e7f0;
   border-radius: 1rem;
+
+.pmt-column.is-drop-available {
+  border-color: #93b4e8;
+  border-style: dashed;
+}
+
+.pmt-column.is-drop-target {
+  background: #e6eefb;
+  border-color: var(--pmt-primary);
+  box-shadow: inset 0 0 0 2px rgba(42, 94, 162, 0.12);
+}
 }
 
 .pmt-column-header {
@@ -202,11 +213,64 @@ body.pmt-body {
   position: relative;
   padding: 1rem;
   margin-bottom: 0.75rem;
+  cursor: grab;
   background: #fff;
   border: 1px solid #e1e7f0;
   border-radius: 0.9rem;
   box-shadow: 0 5px 14px rgba(28, 39, 61, 0.055);
-  transition: transform 160ms ease, box-shadow 160ms ease, border-color 160ms ease;
+  transition: transform 160ms ease, box-shadow 160ms ease, border-color 160ms ease, opacity 160ms ease;
+}
+
+.pmt-task-card.is-dragging {
+  cursor: grabbing;
+  opacity: 0.35;
+  transform: rotate(1deg) scale(0.98);
+}
+
+.pmt-task-card.is-moving {
+  pointer-events: none;
+  opacity: 0.55;
+}
+
+.pmt-card-drag-handle {
+  display: inline-flex;
+  align-items: center;
+  color: #8a96a8;
+  cursor: grab;
+}
+
+.pmt-task-meta {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  gap: 0.55rem;
+  align-items: center;
+  justify-content: space-between;
+  color: var(--pmt-muted);
+  font-size: 0.7rem;
+}
+
+.pmt-task-status-control {
+  width: auto;
+  max-width: 9.25rem;
+  padding-top: 0.22rem;
+  padding-bottom: 0.22rem;
+  color: #4f5f75;
+  font-size: 0.7rem;
+  border-color: #dbe2ec;
+}
+
+.pmt-toast-container {
+  z-index: 1090;
+  margin-top: 4.5rem;
+}
+
+.pmt-kanban-feedback {
+  width: min(26rem, calc(100vw - 2rem));
+  color: #fff;
+  font-size: 0.82rem;
+  border-radius: 0.65rem;
+  box-shadow: 0 12px 28px rgba(25, 39, 64, 0.22);
 }
 
 .pmt-task-card:hover {
