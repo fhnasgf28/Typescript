@@ -4,12 +4,17 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from mcp_transfer_node.auth import authenticate_peer
 from mcp_transfer_node.config import AllowedPeer, TransferSettings, load_allowed_peers
-from mcp_transfer_node.pmt_context import GoogleDocsContextService, GoogleDocsFetcher
-from mcp_transfer_node.pmt_gdocs import read_google_doc
+from mcp_transfer_node.pmt_context import (
+    GOOGLE_DOC_TASK_DESCRIPTION,
+    GoogleDocsContextService,
+    GoogleDocsFetcher,
+)
+from mcp_transfer_node.pmt_gdocs import GoogleDocsError, read_google_doc
 from mcp_transfer_node.pmt_store import LeaseExpiredError, PmtStore, TaskInput
 from mcp_transfer_node.responses import error_response, success_response
 
@@ -77,6 +82,21 @@ class TaskCreate(BaseModel):
     source: str = Field(default="api", max_length=80)
     external_id: str = Field(default="", max_length=240)
     assignee: str = Field(default="", max_length=120)
+    priority: str = "normal"
+    target_branch: str = Field(default="Human-Resources", max_length=240)
+    acceptance_criteria: list[str] = Field(default_factory=list, max_length=100)
+    required_checks: list[str] = Field(default_factory=list, max_length=100)
+
+
+class TaskFromGoogleDocCreate(BaseModel):
+    source_url: str = Field(min_length=1, max_length=2_048)
+    idempotency_key: str = Field(min_length=1, max_length=240)
+    title: str = Field(default="", max_length=300)
+    description: str = Field(default="", max_length=20_000)
+    project: str = Field(default="HMX", max_length=120)
+    module: str = Field(default="", max_length=120)
+    menu: str = Field(default="", max_length=240)
+    assignee: str = Field(default="Farhan", max_length=120)
     priority: str = "normal"
     target_branch: str = Field(default="Human-Resources", max_length=240)
     acceptance_criteria: list[str] = Field(default_factory=list, max_length=100)
@@ -325,6 +345,38 @@ def create_pmt_api_router(
         except ValueError as exc:
             translate_error(exc)
         return success_response({"task": task})
+
+    @router.post("/tasks/from-google-doc")
+    async def create_task_from_google_doc(
+        payload: TaskFromGoogleDocCreate, peer: AllowedPeer = Depends(require_agent)
+    ):
+        require_context_scope(peer, "pmt.context.refresh")
+        try:
+            result = await context_service.create_task_from_google_doc(
+                TaskInput(
+                    title=payload.title or "Google Docs requirement",
+                    description=payload.description or GOOGLE_DOC_TASK_DESCRIPTION,
+                    project=payload.project,
+                    module=payload.module,
+                    menu=payload.menu,
+                    assignee=payload.assignee,
+                    priority=payload.priority,
+                    target_branch=payload.target_branch,
+                    acceptance_criteria=tuple(payload.acceptance_criteria),
+                    required_checks=tuple(payload.required_checks),
+                ),
+                source_url=payload.source_url,
+                title_override=payload.title,
+                actor=peer.name,
+                idempotency_key=payload.idempotency_key,
+            )
+        except (GoogleDocsError, KeyError, PermissionError, ValueError, TimeoutError) as exc:
+            translate_error(exc)
+        response = success_response({"task": result["task"], "context": result["context"]})
+        return JSONResponse(
+            status_code=status.HTTP_201_CREATED if result["created"] else status.HTTP_200_OK,
+            content=response,
+        )
 
     @router.get("/tasks/{task_ref}")
     def get_task(task_ref: str, _: AllowedPeer = Depends(require_agent)):
