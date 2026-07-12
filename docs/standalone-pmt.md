@@ -476,9 +476,12 @@ endpoint and the least-privilege
 `https://www.googleapis.com/auth/drive.metadata.readonly` scope. Drive-triggered
 private CSV export uses a separate
 `https://www.googleapis.com/auth/spreadsheets.readonly` bearer token, sent only
-to the exact validated `https://docs.google.com` export URL. Redirects are never
-followed and never receive Authorization. Existing public/manual sync remains
-unauthenticated and read-only.
+to the exact validated `https://docs.google.com` export URL. Google normally
+returns one bounded `*-sheets.googleusercontent.com` export redirect; PMT
+validates that URL against the requested spreadsheet and tab, then fetches it in
+a separate request without forwarding Authorization. Additional or non-Google
+redirects are rejected. Existing public/manual sync remains unauthenticated and
+read-only.
 
 After enabling configuration, no channel is created automatically. An
 authenticated administrator must explicitly Register from `/pmt/sync`; this

@@ -17,6 +17,7 @@ MAX_SHEET_RESPONSE_BYTES = 5 * 1024 * 1024
 ALLOWED_CSV_CONTENT_TYPES = {"text/csv", "text/plain", "application/octet-stream"}
 SHEET_SYNC_OPERATION_DEADLINE_SECONDS = 60
 _SHEET_PATH_RE = re.compile(r"^/spreadsheets/d/[A-Za-z0-9_-]{1,200}/export/?$")
+_SHEET_REDIRECT_HOST_RE = re.compile(r"^[a-z0-9-]{1,120}-sheets\.googleusercontent\.com$")
 HEADER_ALIASES = {
     "developer": ("dev", "developer", "assignee"),
     "status": ("dev status", "developer status"),
@@ -128,6 +129,43 @@ def sheet_source_id(url: str) -> str:
     return f"{spreadsheet_id}:{gid}"
 
 
+def validate_sheet_export_redirect(url: str, source_url: str) -> str:
+    """Validate Google's one-time CSV export URL without forwarding credentials."""
+    if not isinstance(url, str) or not url or len(url) > 4096:
+        raise ValueError("sheet export redirect is invalid")
+    source_id = sheet_source_id(source_url)
+    spreadsheet_id, expected_gid = source_id.split(":", 1)
+    try:
+        parsed = urlparse(url)
+        port = parsed.port
+        query = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("sheet export redirect is malformed") from exc
+    path_parts = [part for part in parsed.path.split("/") if part]
+    query_values = dict(query)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname is None
+        or _SHEET_REDIRECT_HOST_RE.fullmatch(parsed.hostname) is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.fragment
+        or not parsed.path.startswith("/export/")
+        or not path_parts
+        or path_parts[-1] != spreadsheet_id
+        or len(path_parts) > 12
+        or any(len(part) > 240 for part in path_parts)
+        or len(query) > 2
+        or any(key not in {"format", "gid"} for key, _value in query)
+        or len({key for key, _value in query}) != len(query)
+        or query_values.get("format", "csv") != "csv"
+        or query_values.get("gid", "0") != expected_gid
+    ):
+        raise ValueError("sheet export redirect must use Google's bounded export endpoint")
+    return url
+
+
 async def sync_google_sheet(
     store: PmtStore,
     payload: dict[str, Any],
@@ -162,21 +200,45 @@ async def sync_google_sheet(
             async with httpx.AsyncClient(
                 timeout=timeout, follow_redirects=False, transport=transport
             ) as client:
-                async with client.stream("GET", url, headers=headers) as response:
-                    if response.is_redirect:
-                        raise ValueError("sheet redirects are not allowed")
-                    response.raise_for_status()
-                    if validate_sheet_url(str(response.url)) != url:
-                        raise ValueError("sheet response URL changed unexpectedly")
-                    content_type = (
-                        response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-                    )
-                    if content_type and content_type not in ALLOWED_CSV_CONTENT_TYPES:
-                        raise ValueError("sheet response must be CSV or plain text")
-                    async for chunk in response.aiter_bytes():
-                        content.extend(chunk)
-                        if len(content) > MAX_SHEET_RESPONSE_BYTES:
-                            raise ValueError("sheet response exceeds 5 MB")
+                request_url = url
+                request_headers = headers
+                for request_number in range(2):
+                    async with client.stream(
+                        "GET", request_url, headers=request_headers
+                    ) as response:
+                        if response.is_redirect:
+                            if request_number != 0:
+                                raise ValueError("additional sheet redirects are not allowed")
+                            redirect_url = validate_sheet_export_redirect(
+                                response.headers.get("location", ""), url
+                            )
+                            request_url = redirect_url
+                            # The bearer credential is pinned to docs.google.com. Google's
+                            # bounded one-time export URL is fetched in a separate request
+                            # with no Authorization header.
+                            request_headers = {"Accept": "text/csv,text/plain;q=0.9"}
+                            continue
+                        response.raise_for_status()
+                        if request_number == 0:
+                            if validate_sheet_url(str(response.url)) != url:
+                                raise ValueError("sheet response URL changed unexpectedly")
+                        elif str(response.url) != request_url:
+                            raise ValueError("sheet redirect response URL changed unexpectedly")
+                        content_type = (
+                            response.headers.get("content-type", "")
+                            .split(";", 1)[0]
+                            .strip()
+                            .lower()
+                        )
+                        if content_type and content_type not in ALLOWED_CSV_CONTENT_TYPES:
+                            raise ValueError("sheet response must be CSV or plain text")
+                        async for chunk in response.aiter_bytes():
+                            content.extend(chunk)
+                            if len(content) > MAX_SHEET_RESPONSE_BYTES:
+                                raise ValueError("sheet response exceeds 5 MB")
+                        break
+                else:  # pragma: no cover - the bounded loop always breaks or raises
+                    raise ValueError("sheet export did not return content")
             csv_text = bytes(content).decode("utf-8-sig")
             parsed = parse_google_sheet_tasks(csv_text, assignee=assignee, dev_status=dev_status)
             imported: list[str] = []

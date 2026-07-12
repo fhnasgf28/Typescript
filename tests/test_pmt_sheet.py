@@ -76,7 +76,7 @@ async def test_sync_google_sheet_imports_once(settings):
 
 
 @pytest.mark.asyncio
-async def test_sync_google_sheet_rejects_redirect_even_from_google(settings):
+async def test_sync_google_sheet_rejects_untrusted_redirect(settings):
     store = PmtStore(settings.pmt_db_path)
     store.initialize()
 
@@ -87,7 +87,7 @@ async def test_sync_google_sheet_rejects_redirect_even_from_google(settings):
             request=request,
         )
 
-    with pytest.raises(ValueError, match="redirects are not allowed"):
+    with pytest.raises(ValueError, match="bounded export endpoint"):
         await sync_google_sheet(
             store,
             {"csv_url": "https://docs.google.com/spreadsheets/d/example/export?format=csv"},
@@ -208,23 +208,42 @@ async def test_sheet_bearer_is_pinned_to_exact_origin_and_never_forwarded(settin
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append((str(request.url), request.headers.get("authorization")))
+        if request.url.host == "docs.google.com":
+            return httpx.Response(
+                307,
+                headers={
+                    "location": (
+                        "https://doc-14-80-sheets.googleusercontent.com/"
+                        "export/session/capability/*/example?format=csv"
+                    )
+                },
+                request=request,
+            )
         return httpx.Response(
-            302, headers={"location": "https://evil.test/private"}, request=request
+            200,
+            text=SHEET_CSV,
+            headers={"content-type": "text/csv"},
+            request=request,
         )
 
-    with pytest.raises(ValueError, match="redirects are not allowed"):
-        await sync_google_sheet(
-            store,
-            {"csv_url": "https://docs.google.com/spreadsheets/d/example/export?format=csv"},
-            actor="drive-worker",
-            bearer_token="private-access-token",
-            transport=httpx.MockTransport(handler),
-        )
+    result = await sync_google_sheet(
+        store,
+        {"csv_url": "https://docs.google.com/spreadsheets/d/example/export?format=csv"},
+        actor="drive-worker",
+        bearer_token="private-access-token",
+        transport=httpx.MockTransport(handler),
+    )
+    assert result["imported"] == ["PMT-0001"]
     assert requests == [
         (
             "https://docs.google.com/spreadsheets/d/example/export?format=csv",
             "Bearer private-access-token",
-        )
+        ),
+        (
+            "https://doc-14-80-sheets.googleusercontent.com/"
+            "export/session/capability/*/example?format=csv",
+            None,
+        ),
     ]
 
     seen = []
