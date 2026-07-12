@@ -39,7 +39,7 @@
         <div class="col-sm-6 col-lg-3">
           <label class="form-label small fw-semibold" for="approval-status">Status</label>
           <select class="form-select" id="approval-status" name="approval_status">
-            <option value="">Semua status</option>
+            <option value="">All statuses</option>
             {% for item in approval_statuses %}<option value="{{ item }}">{{ item|replace('_', ' ')|title }}</option>{% endfor %}
           </select>
         </div>
@@ -68,8 +68,8 @@
           {% else %}
           <div class="pmt-surface p-5 text-center">
             <div class="display-6 mb-3">✓</div>
-            <h2 class="h4 pmt-page-title">Tidak ada approval request</h2>
-            <p class="pmt-muted mb-0">External action tetap diblokir sampai request dibuat dan disetujui.</p>
+            <h2 class="h4 pmt-page-title">No approval requests</h2>
+            <p class="pmt-muted mb-0">External actions remain blocked until a request is created and approved.</p>
           </div>
           {% endfor %}
         </div>
@@ -82,7 +82,7 @@
             <div>
               <span class="pmt-eyebrow">{{ selected.approval_key }} · {{ selected.action_type }}</span>
               <h2 class="pmt-page-title h3 mt-2 mb-1">{{ selected.title }}</h2>
-              <div class="small pmt-muted">SHA-256 {{ selected.payload_sha256 }}</div>
+              <div class="small pmt-muted pmt-hash">SHA-256 {{ selected.payload_sha256 }}</div>
             </div>
             <span class="pmt-status-badge pmt-approval-{{ selected.status }} align-self-start">{{ selected.status|replace('_', ' ')|title }}</span>
           </div>
@@ -90,7 +90,7 @@
           <h3 class="h6 fw-bold text-uppercase text-secondary">Immutable payload</h3>
           <pre class="pmt-code-block mb-4"><code>{{ selected.payload|tojson(indent=2) }}</code></pre>
           <dl class="row small mb-0">
-            <dt class="col-sm-4">Requested by</dt><dd class="col-sm-8">{{ selected.requested_by }}</dd>
+            <dt class="col-sm-4">Requested by</dt><dd class="col-sm-8 text-break">{{ selected.requested_by }}</dd>
             <dt class="col-sm-4">Decision</dt><dd class="col-sm-8">{{ selected.decided_by or '—' }}{% if selected.decision_note %} · {{ selected.decision_note }}{% endif %}</dd>
             <dt class="col-sm-4">Approval expiry</dt><dd class="col-sm-8">{{ selected.expires_at or '—' }}</dd>
             <dt class="col-sm-4">Executor</dt><dd class="col-sm-8">{{ selected.claimed_by or '—' }}</dd>
@@ -100,8 +100,8 @@
         {% if selected.status in ('pending', 'approved', 'failed', 'expired') %}
         <article class="pmt-surface p-4 mb-4">
           <h3 class="h5 pmt-page-title">Human decision</h3>
-          <p class="small pmt-muted">Ketik <strong>{{ selected.approval_key }}</strong> untuk mengikat keputusan pada payload di atas.</p>
-          {% if selected.requested_by == principal %}<div class="alert alert-warning small">Requester tidak dapat menyetujui request miliknya sendiri. Gunakan principal manusia lain, atau batalkan request ini.</div>{% endif %}
+          <p class="small pmt-muted">Type <strong>{{ selected.approval_key }}</strong> to bind the decision to the payload above.</p>
+          {% if selected.requested_by == principal %}<div class="alert alert-warning small">The requester cannot approve their own request. Use another named human principal or cancel this request.</div>{% endif %}
           <form method="post" action="/pmt/approvals/{{ selected.approval_key }}/decision">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <input type="hidden" name="version" value="{{ selected.version }}">
@@ -110,7 +110,7 @@
               <div class="col-md-6"><label class="form-label fw-semibold" for="ttl">Approval TTL (minutes)</label><input class="form-control" id="ttl" name="approval_ttl_minutes" type="number" min="5" max="1440" value="60"></div>
               <div class="col-12"><label class="form-label fw-semibold" for="decision-note">Decision note</label><textarea class="form-control" id="decision-note" name="note" rows="3"></textarea></div>
               <div class="col-12 d-flex flex-wrap gap-2">
-                {% if selected.status in ('pending', 'failed', 'expired') and selected.requested_by != principal %}<button class="btn btn-success" name="decision" value="approve" type="submit">Approve bounded action</button>{% endif %}
+                {% if selected.status in ('pending', 'failed', 'expired') and selected.requested_by != principal %}<button class="btn btn-success" id="approve-bounded-action" name="decision" value="approve" type="submit" disabled>Approve bounded action</button>{% endif %}
                 {% if selected.status in ('pending', 'approved') %}<button class="btn btn-outline-danger" name="decision" value="reject" type="submit">Reject</button><button class="btn btn-outline-secondary" name="decision" value="cancel" type="submit">Cancel</button>{% endif %}
               </div>
             </div>
@@ -123,7 +123,7 @@
           <div class="pmt-timeline">
             {% for event in events %}
             <div class="pmt-timeline-item"><span class="pmt-timeline-dot"></span><div class="fw-semibold">{{ event.event_type }}</div><div class="small pmt-muted">{{ event.actor }} · {{ event.created_at }}</div></div>
-            {% else %}<div class="small pmt-muted">Belum ada event.</div>{% endfor %}
+            {% else %}<div class="small pmt-muted">No events yet.</div>{% endfor %}
           </div>
           {% if runs %}<hr><div class="small fw-bold mb-2">Execution attempts</div>{% for run in runs %}<div class="small mb-2"><code>{{ run.id }}</code> · {{ run.status }} · {{ run.executor_id }}</div>{% endfor %}{% endif %}
         </article>
@@ -151,6 +151,17 @@
       </form>
     </div>
   </div>
+  <script>
+    (() => {
+      const confirmation = document.getElementById("confirm-key");
+      const approve = document.getElementById("approve-bounded-action");
+      if (!confirmation || !approve) return;
+      const expected = {{ (selected.approval_key if selected else "")|tojson }};
+      const refresh = () => { approve.disabled = confirmation.value.trim() !== expected; };
+      confirmation.addEventListener("input", refresh);
+      refresh();
+    })();
+  </script>
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js" integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz" crossorigin="anonymous"></script>
 </body>
 </html>

@@ -35,6 +35,12 @@ def _require_login(request: Request) -> None:
         )
 
 
+def _require_csrf(request: Request, supplied: str) -> None:
+    expected = str(request.session.get("csrf_token", ""))
+    if not expected or not secrets.compare_digest(expected, supplied):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="CSRF token tidak valid")
+
+
 def create_web_router(settings: TransferSettings) -> APIRouter:
     router = APIRouter()
 
@@ -65,7 +71,9 @@ def create_web_router(settings: TransferSettings) -> APIRouter:
         return RedirectResponse("/pmt", status_code=status.HTTP_303_SEE_OTHER)
 
     @router.post("/logout")
-    def logout(request: Request) -> RedirectResponse:
+    def logout(request: Request, csrf_token: str = Form(...)) -> RedirectResponse:
+        _require_login(request)
+        _require_csrf(request, csrf_token)
         request.session.clear()
         return RedirectResponse("/login", status_code=status.HTTP_303_SEE_OTHER)
 
@@ -85,7 +93,11 @@ def create_web_router(settings: TransferSettings) -> APIRouter:
         return TEMPLATES.TemplateResponse(
             request,
             "index.html",
-            {"settings": settings, "records": records},
+            {
+                "settings": settings,
+                "records": records,
+                "csrf_token": request.session["csrf_token"],
+            },
         )
 
     @router.post("/web/upload")
@@ -94,8 +106,10 @@ def create_web_router(settings: TransferSettings) -> APIRouter:
         file: UploadFile = File(...),
         source: str = Form(default="manual"),
         note: str = Form(default=""),
+        csrf_token: str = Form(...),
     ) -> RedirectResponse:
         _require_login(request)
+        _require_csrf(request, csrf_token)
         received_at = datetime.now(timezone.utc)
         transfer_id = f"transfer_{uuid.uuid4().hex}"
         original_filename = file.filename or "uploaded-file"
@@ -163,8 +177,11 @@ def create_web_router(settings: TransferSettings) -> APIRouter:
         return FileResponse(path, filename=record.original_filename)
 
     @router.post("/web/files/{transfer_id}/delete")
-    def web_delete(request: Request, transfer_id: str) -> RedirectResponse:
+    def web_delete(
+        request: Request, transfer_id: str, csrf_token: str = Form(...)
+    ) -> RedirectResponse:
         _require_login(request)
+        _require_csrf(request, csrf_token)
         record = get_record(_metadata_path(settings), transfer_id)
         if record is not None:
             path = Path(record.stored_path)

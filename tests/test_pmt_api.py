@@ -573,6 +573,9 @@ def test_pmt_web_approval_center_requires_csrf_confirmation_and_separation(clien
         admin_request=True,
     )
     detail = client.get(f"/pmt/approvals/{agent_approval['approval_key']}")
+    assert 'id="approve-bounded-action"' in detail.text
+    assert 'type="submit" disabled' in detail.text
+    assert "confirmation.value.trim() !== expected" in detail.text
     version = re.search(r'name="version" value="(\d+)"', detail.text).group(1)
     approved = client.post(
         f"/pmt/approvals/{agent_approval['approval_key']}/decision",

@@ -336,6 +336,11 @@ body.pmt-body {
   border-radius: 0.9rem;
 }
 
+.pmt-hash {
+  overflow-wrap: anywhere;
+  font-family: var(--bs-font-monospace);
+}
+
 .pmt-responsive-table { overflow-x: auto; }
 .pmt-responsive-table .table { min-width: 42rem; }
 
@@ -440,6 +445,8 @@ body.pmt-body {
 .pmt-login-feature-dot { width: 0.5rem; height: 0.5rem; background: #a5b4fc; border-radius: 50%; }
 
 @media (max-width: 767.98px) {
+  .btn { min-height: 44px; }
+  .pmt-timeline-item > .d-flex { align-items: flex-start !important; flex-direction: column; gap: 0.25rem !important; }
   .pmt-login-shell { grid-template-columns: 1fr; }
   .pmt-login-visual { min-height: auto; padding: 2rem; }
   .pmt-login-visual .pmt-login-features { display: none; }
