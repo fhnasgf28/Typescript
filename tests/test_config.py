@@ -90,6 +90,74 @@ def test_load_settings_google_docs_is_optional_and_bounded(tmp_path: Path) -> No
         load_settings({**base, "MCP_PMT_GOOGLE_DOCS_TIMEOUT_SECONDS": "61"})
 
 
+def test_drive_watch_defaults_off_and_validates_complete_same_origin_config(tmp_path: Path) -> None:
+    base = {
+        "MCP_TRANSFER_SERVER_NAME": "server-b",
+        "MCP_TRANSFER_HOME_ALLOWLIST_PREFIX": str(tmp_path),
+        "MCP_TRANSFER_BASE_DIR": str(tmp_path / "runtime"),
+        "MCP_TRANSFER_WEB_ADMIN_PASSWORD": "admin-password",
+        "MCP_TRANSFER_SESSION_SECRET": "session-secret-with-more-than-32-chars",
+        "MCP_TRANSFER_PUBLIC_URL": "https://pmt.example.com",
+    }
+    assert load_settings(base).pmt_drive_watch_enabled is False
+    enabled = {
+        **base,
+        "MCP_PMT_DRIVE_WATCH_ENABLED": "true",
+        "MCP_PMT_DRIVE_SPREADSHEET_ID": "sheet_123",
+        "MCP_PMT_DRIVE_CSV_URL": (
+            "https://docs.google.com/spreadsheets/d/sheet_123/export?format=csv&gid=0"
+        ),
+        "MCP_PMT_DRIVE_WEBHOOK_SECRET": "x" * 32,
+        "MCP_PMT_GOOGLE_DOCS_SERVICE_ACCOUNT_FILE": str(tmp_path / "credential.json"),
+    }
+    configured = load_settings(enabled)
+    assert configured.pmt_drive_webhook_callback_url == (
+        "https://pmt.example.com/api/v1/pmt/drive-notifications/bug-tracker"
+    )
+
+    bad_values = (
+        {"MCP_PMT_DRIVE_WEBHOOK_SECRET": "short"},
+        {"MCP_PMT_DRIVE_SPREADSHEET_ID": "different"},
+        {
+            "MCP_PMT_DRIVE_WEBHOOK_CALLBACK_URL": "https://evil.test/api/v1/pmt/drive-notifications/bug-tracker"
+        },
+        {
+            "MCP_PMT_DRIVE_WEBHOOK_CALLBACK_URL": "https://pmt.example.com:443/api/v1/pmt/drive-notifications/bug-tracker"
+        },
+        {
+            "MCP_PMT_DRIVE_WEBHOOK_CALLBACK_URL": "https://user@pmt.example.com/api/v1/pmt/drive-notifications/bug-tracker"
+        },
+    )
+    for override in bad_values:
+        with pytest.raises(ValueError):
+            load_settings({**enabled, **override})
+
+
+def test_legacy_http_public_url_is_allowed_only_when_drive_watch_disabled(tmp_path: Path) -> None:
+    base = {
+        "MCP_TRANSFER_SERVER_NAME": "server-b",
+        "MCP_TRANSFER_HOME_ALLOWLIST_PREFIX": str(tmp_path),
+        "MCP_TRANSFER_BASE_DIR": str(tmp_path / "runtime"),
+        "MCP_TRANSFER_WEB_ADMIN_PASSWORD": "admin-password",
+        "MCP_TRANSFER_SESSION_SECRET": "session-secret-with-more-than-32-chars",
+        "MCP_TRANSFER_PUBLIC_URL": "http://127.0.0.1:8787/",
+    }
+    assert load_settings(base).public_url == "http://127.0.0.1:8787"
+    with pytest.raises(ValueError, match="exact HTTPS origin"):
+        load_settings(
+            {
+                **base,
+                "MCP_PMT_DRIVE_WATCH_ENABLED": "true",
+                "MCP_PMT_DRIVE_SPREADSHEET_ID": "sheet_123",
+                "MCP_PMT_DRIVE_CSV_URL": (
+                    "https://docs.google.com/spreadsheets/d/sheet_123/export?format=csv"
+                ),
+                "MCP_PMT_DRIVE_WEBHOOK_SECRET": "x" * 32,
+                "MCP_PMT_GOOGLE_DOCS_SERVICE_ACCOUNT_FILE": str(tmp_path / "credential.json"),
+            }
+        )
+
+
 def test_load_destinations_reads_aliases(tmp_path: Path) -> None:
     config_path = tmp_path / "destinations.json"
     config_path.write_text(

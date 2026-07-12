@@ -4,6 +4,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 
 from mcp_transfer_node import pmt_worker
+from mcp_transfer_node.pmt_sheet import SheetSyncBusy
 from mcp_transfer_node.pmt_store import PmtStore
 
 
@@ -45,3 +46,33 @@ def test_worker_reconciles_approval_lease_even_without_due_schedule(settings, mo
     assert result["maintenance"]["approvals"]["count"] == 1
     assert store.get_approval(approval["approval_key"])["status"] == "approved"
     assert store.list_approval_runs(approval["approval_key"])[0]["status"] == "timed_out"
+
+
+def test_worker_marks_busy_sheet_schedule_skipped_without_failure_details(settings, monkeypatch):
+    store = PmtStore(settings.pmt_db_path)
+    store.initialize()
+    schedule = store.create_schedule(
+        "busy sync",
+        "google_sheet_sync",
+        300,
+        {"csv_url": "https://docs.google.com/spreadsheets/d/example/export?format=csv"},
+        "admin",
+    )
+
+    with store._transaction() as db:
+        db.execute(
+            "UPDATE schedules SET next_run_at=? WHERE id=?",
+            ((datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(), schedule["id"]),
+        )
+
+    async def busy(*_args, **_kwargs):
+        raise SheetSyncBusy("PRIVATE_LEASE_OWNER")
+
+    monkeypatch.setattr(pmt_worker, "load_settings", lambda: settings)
+    monkeypatch.setattr(pmt_worker, "sync_google_sheet", busy)
+    result = asyncio.run(pmt_worker.run_once("schedule-worker"))
+
+    assert result["status"] == "skipped"
+    assert "PRIVATE_LEASE_OWNER" not in str(result)
+    runs = store.list_schedule_runs(schedule_id=schedule["id"])
+    assert runs[0]["status"] == "skipped"

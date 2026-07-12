@@ -598,6 +598,18 @@ async def _default_access_token_provider(
     return await asyncio.to_thread(load_and_refresh)
 
 
+async def get_google_access_token(
+    credential_path: Path, scopes: tuple[str, ...], timeout_seconds: float
+) -> str:
+    """Acquire a bounded OAuth token using the hardened service-account reader."""
+    timeout = max(3.0, min(float(timeout_seconds), 60.0))
+    try:
+        async with asyncio.timeout(timeout):
+            return await _default_access_token_provider(credential_path, scopes, timeout)
+    except TimeoutError as exc:
+        raise GoogleDocsError("Google authentication timed out") from exc
+
+
 async def read_google_doc(
     url: str,
     service_account_file: str | Path,

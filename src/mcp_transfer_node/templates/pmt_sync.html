@@ -39,6 +39,31 @@
       <strong>Safe migration:</strong> sinkronisasi hanya membuat task baru secara idempotent. Status Sheet, notes, dan attachment tidak pernah diubah oleh job ini.
     </div>
 
+    <section class="pmt-surface p-3 p-sm-4 mb-4" aria-labelledby="drive-watch-title">
+      <div class="d-flex flex-column flex-md-row justify-content-between gap-3">
+        <div>
+          <span class="pmt-eyebrow">Event-driven connector</span>
+          <h2 class="h4 pmt-page-title mt-1 mb-1" id="drive-watch-title">Google Drive watch</h2>
+          <p class="small pmt-muted mb-0">Webhook hanya memicu Shadow Sync setelah debounce; token dan resource ID tidak ditampilkan.</p>
+        </div>
+        <span class="pmt-status-badge {% if settings.pmt_drive_watch_enabled %}pmt-status-online{% else %}pmt-status-disabled{% endif %}">{% if settings.pmt_drive_watch_enabled %}Configured{% else %}Disabled{% endif %}</span>
+      </div>
+      <div class="row g-3 mt-1">
+        <div class="col-12 col-md-7">
+          {% set active = drive_watch.channels|selectattr('state', 'equalto', 'active')|list %}
+          <div class="small"><strong>Active channels:</strong> {{ active|length }}</div>
+          <div class="small"><strong>Desired lifecycle:</strong> {{ 'Running / auto-renew' if drive_watch.desired_active else 'Stopped / manual register required' }}</div>
+          <div class="small pmt-muted text-break">Expiration: {{ active[0].expiration_at if active else 'Belum terdaftar' }}</div>
+          <div class="small pmt-muted">Pending events: {{ drive_watch.events.pending or 0 }} · Failed/retrying: {{ drive_watch.events.failed or 0 }} · Exhausted: {{ drive_watch.events.exhausted or 0 }}</div>
+        </div>
+        <div class="col-12 col-md-5 d-flex flex-wrap justify-content-md-end gap-2 align-items-start">
+          <form method="post" action="/pmt/sync/drive-watch/register"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm pmt-btn-primary" type="submit" {% if not settings.pmt_drive_watch_enabled %}disabled{% endif %}>Register</button></form>
+          <form method="post" action="/pmt/sync/drive-watch/renew"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm btn-outline-primary" type="submit" {% if not settings.pmt_drive_watch_enabled or not active %}disabled{% endif %}>Renew</button></form>
+          <form method="post" action="/pmt/sync/drive-watch/stop"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-sm btn-outline-danger" type="submit" {% if not settings.pmt_drive_watch_enabled or (not active and not drive_watch.desired_active) %}disabled{% endif %}>Stop</button></form>
+        </div>
+      </div>
+    </section>
+
     <section class="row g-4 mb-4">
       <div class="col-12 col-xl-5">
         <article class="pmt-surface p-4 h-100">

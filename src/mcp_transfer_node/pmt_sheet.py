@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import csv
 import io
+import asyncio
+import uuid
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+import re
+from urllib.parse import parse_qs, parse_qsl, urlparse
 
 import httpx
 
@@ -12,6 +15,8 @@ from mcp_transfer_node.pmt_store import PmtStore, TaskInput
 ALLOWED_SHEET_HOSTS = {"docs.google.com"}
 MAX_SHEET_RESPONSE_BYTES = 5 * 1024 * 1024
 ALLOWED_CSV_CONTENT_TYPES = {"text/csv", "text/plain", "application/octet-stream"}
+SHEET_SYNC_OPERATION_DEADLINE_SECONDS = 60
+_SHEET_PATH_RE = re.compile(r"^/spreadsheets/d/[A-Za-z0-9_-]{1,200}/export/?$")
 HEADER_ALIASES = {
     "developer": ("dev", "developer", "assignee"),
     "status": ("dev status", "developer status"),
@@ -20,6 +25,10 @@ HEADER_ALIASES = {
     "module": ("module", "addons", "app"),
     "attachment": ("attachment", "attachment link", "evidence"),
 }
+
+
+class SheetSyncBusy(RuntimeError):
+    """Raised when another process owns the durable sync lease for this Sheet."""
 
 
 def _normalized(value: str) -> str:
@@ -79,8 +88,27 @@ def parse_google_sheet_tasks(
 
 
 def validate_sheet_url(url: str) -> str:
-    parsed = urlparse(url)
-    if parsed.scheme != "https" or parsed.hostname not in ALLOWED_SHEET_HOSTS:
+    if not isinstance(url, str) or not url or len(url) > 2048:
+        raise ValueError("sheet URL is invalid")
+    try:
+        parsed = urlparse(url)
+        port = parsed.port
+        query = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("sheet URL is malformed") from exc
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname not in ALLOWED_SHEET_HOSTS
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.fragment
+        or _SHEET_PATH_RE.fullmatch(parsed.path) is None
+        or len(query) > 2
+        or any(key not in {"format", "gid"} for key, _value in query)
+        or len({key for key, _value in query}) != len(query)
+        or dict(query).get("format", "csv") != "csv"
+    ):
         raise ValueError("sheet URL must use HTTPS on docs.google.com")
     return url
 
@@ -106,6 +134,7 @@ async def sync_google_sheet(
     *,
     actor: str,
     transport: httpx.AsyncBaseTransport | None = None,
+    bearer_token: str | None = None,
 ) -> dict[str, Any]:
     url = validate_sheet_url(str(payload.get("csv_url", "")))
     source_id = sheet_source_id(url)
@@ -113,52 +142,76 @@ async def sync_google_sheet(
     dev_status = str(payload.get("dev_status", "To-Do"))
     timeout = float(payload.get("timeout_seconds", 30))
     timeout = max(3, min(timeout, 60))
-    content = bytearray()
-    async with httpx.AsyncClient(
-        timeout=timeout, follow_redirects=False, transport=transport
-    ) as client:
-        async with client.stream("GET", url) as response:
-            if response.is_redirect:
-                raise ValueError("sheet redirects are not allowed")
-            response.raise_for_status()
-            validate_sheet_url(str(response.url))
-            content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-            if content_type and content_type not in ALLOWED_CSV_CONTENT_TYPES:
-                raise ValueError("sheet response must be CSV or plain text")
-            async for chunk in response.aiter_bytes():
-                content.extend(chunk)
-                if len(content) > MAX_SHEET_RESPONSE_BYTES:
-                    raise ValueError("sheet response exceeds 5 MB")
-    csv_text = bytes(content).decode("utf-8-sig")
-    parsed = parse_google_sheet_tasks(csv_text, assignee=assignee, dev_status=dev_status)
-    imported: list[str] = []
-    existing: list[str] = []
-    for row in parsed:
-        external_id = f"sheet:{source_id}:row:{row['sheet_row']}"
-        before = store.get_external_task("google_sheet", external_id)
-        task = store.create_task(
-            TaskInput(
-                title=row["title"],
-                description=(
-                    f"Imported from Google Sheet row {row['sheet_row']}"
-                    + (f"\nAttachment: {row['attachment']}" if row["attachment"] else "")
-                ),
-                project=str(payload.get("project", "HMX")),
-                module=row["module"],
-                menu=row["menu"],
-                source="google_sheet",
-                external_id=external_id,
-                assignee=row["assignee"],
-                priority=str(payload.get("priority", "normal")),
-                target_branch=str(payload.get("target_branch", "Human-Resources")),
-            ),
-            actor=actor,
-        )
-        (existing if before else imported).append(task["task_key"])
-    return {
-        "matched": len(parsed),
-        "imported": imported,
-        "already_present": existing,
-        "filter": {"assignee": assignee, "dev_status": dev_status},
-        "source_id": source_id,
-    }
+    if bearer_token is not None and (
+        not isinstance(bearer_token, str)
+        or not bearer_token
+        or any(char.isspace() for char in bearer_token)
+    ):
+        raise ValueError("Sheet bearer token is invalid")
+    run_id = f"sheet_sync_{uuid.uuid4().hex}"
+    lease_key = "google_sheet_sync"
+    if not store.claim_sheet_sync_lease(lease_key, actor, run_id):
+        raise SheetSyncBusy("Google Sheet sync is already in progress")
+    try:
+        async with asyncio.timeout(SHEET_SYNC_OPERATION_DEADLINE_SECONDS):
+            content = bytearray()
+            headers = {"Accept": "text/csv,text/plain;q=0.9"}
+            # validate_sheet_url pins the only origin which may receive this credential.
+            if bearer_token is not None:
+                headers["Authorization"] = f"Bearer {bearer_token}"
+            async with httpx.AsyncClient(
+                timeout=timeout, follow_redirects=False, transport=transport
+            ) as client:
+                async with client.stream("GET", url, headers=headers) as response:
+                    if response.is_redirect:
+                        raise ValueError("sheet redirects are not allowed")
+                    response.raise_for_status()
+                    if validate_sheet_url(str(response.url)) != url:
+                        raise ValueError("sheet response URL changed unexpectedly")
+                    content_type = (
+                        response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                    )
+                    if content_type and content_type not in ALLOWED_CSV_CONTENT_TYPES:
+                        raise ValueError("sheet response must be CSV or plain text")
+                    async for chunk in response.aiter_bytes():
+                        content.extend(chunk)
+                        if len(content) > MAX_SHEET_RESPONSE_BYTES:
+                            raise ValueError("sheet response exceeds 5 MB")
+            csv_text = bytes(content).decode("utf-8-sig")
+            parsed = parse_google_sheet_tasks(csv_text, assignee=assignee, dev_status=dev_status)
+            imported: list[str] = []
+            existing: list[str] = []
+            for row in parsed:
+                # Run fencing immediately before every durable mutation prevents a stale
+                # network worker from importing after its lease has been reclaimed.
+                store.assert_sheet_sync_lease(lease_key, actor, run_id)
+                external_id = f"sheet:{source_id}:row:{row['sheet_row']}"
+                before = store.get_external_task("google_sheet", external_id)
+                task = store.create_task(
+                    TaskInput(
+                        title=row["title"],
+                        description=(
+                            f"Imported from Google Sheet row {row['sheet_row']}"
+                            + (f"\nAttachment: {row['attachment']}" if row["attachment"] else "")
+                        ),
+                        project=str(payload.get("project", "HMX")),
+                        module=row["module"],
+                        menu=row["menu"],
+                        source="google_sheet",
+                        external_id=external_id,
+                        assignee=row["assignee"],
+                        priority=str(payload.get("priority", "normal")),
+                        target_branch=str(payload.get("target_branch", "Human-Resources")),
+                    ),
+                    actor=actor,
+                )
+                (existing if before else imported).append(task["task_key"])
+            return {
+                "matched": len(parsed),
+                "imported": imported,
+                "already_present": existing,
+                "filter": {"assignee": assignee, "dev_status": dev_status},
+                "source_id": source_id,
+            }
+    finally:
+        store.release_sheet_sync_lease(lease_key, actor, run_id)

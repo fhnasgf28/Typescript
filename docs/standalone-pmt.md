@@ -354,7 +354,7 @@ For Docker, use the opt-in overlay and prepare a dedicated read-only file owned 
 ```bash
 install -o 10001 -g 10001 -m 0600 /safe/source/service-account.json /safe/pmt/google-service-account.json
 export MCP_PMT_GOOGLE_DOCS_CREDENTIAL_HOST_FILE=/safe/pmt/google-service-account.json
-docker compose -f docker-compose.yml -f deploy/docker-compose.gdocs.yml up -d
+docker compose -f docker-compose.yml -f deploy/docker-compose.gdocs.yml --profile worker up -d
 ```
 
 The credential bind mount is read-only at `/run/pmt-secrets/google-service-account.json`. Do not bake credentials into the image or repository.
@@ -399,6 +399,10 @@ The importer:
 - imports only matching task rows
 - stores spreadsheet ID + gid + row as a source-aware idempotent identity
 - does not write back to the Sheet
+- takes one durable, process-shared Sheet sync lease before any fetch; Drive,
+  scheduled, and manual entry points cannot overlap fetch/parse/import work
+- uses a 60-second whole-operation deadline and a 90-second fenced lease, and
+  rechecks the run fence before each task mutation
 
 Run one due schedule:
 
@@ -407,6 +411,12 @@ MCP_PMT_AGENT_ID=pmt-scheduler mcp-pmt-worker
 ```
 
 Use one system cron or timer on the **central PMT server** to invoke the worker once per minute. Before installing a system scheduler, inspect and merge with the existing cron/timer configuration. Do not run duplicate central workers unless they use unique IDs; database leases still prevent duplicate ownership.
+
+Docker users can instead enable the `worker` profile. `pmt-worker` uses the same
+image, environment, named data volume, and optional read-only credential mount,
+exposes no port, and invokes one recovery pass every 60 seconds. That cadence
+only checks local due state; it does not poll Sheet content unless a schedule or
+durable Drive event is due.
 
 ## HMX recommended agent flow
 
@@ -430,7 +440,7 @@ Use one system cron or timer on the **central PMT server** to invoke the worker 
 - Peer scope enforcement currently protects approval execution only; broader endpoint-level scopes remain future work.
 - Schedules are interval-based, not full cron expressions.
 - Sheet identity includes spreadsheet ID, gid, and row number. A stable source UUID column is still recommended before rows are frequently reordered.
-- No attachment upload, webhook receiver, GitLab write, Sheet write-back, notification send, pipeline retry, or deployment action is implemented.
+- No attachment upload, GitLab write, Sheet write-back, notification send, pipeline retry, or deployment action is implemented.
 - Stable Sheet source-row UUIDs are required before enabling controlled write-back; row-number identity is insufficient.
 - Task dependencies, evidence verdict automation, and sprint analytics remain follow-up modules.
 
@@ -444,3 +454,66 @@ Use one system cron or timer on the **central PMT server** to invoke the worker 
 6. structured evidence and required-check verdicts
 7. GitLab read-only pipeline/MR connector
 8. audit export, metrics, backups, retention, webhook signatures, and rate limits
+
+## Event-driven Google Drive Shadow Sync
+
+The Bug Tracker connector can use Google Drive API v3 `files.watch` rather than
+polling the Sheet. It is disabled by default and does not enable existing Sheet
+poll schedules. The existing manual CSV Shadow Sync remains read-only and
+idempotent.
+
+Configuration is shown in `.env.example`. Set the exact spreadsheet ID and its
+bounded `docs.google.com/.../export?format=csv` URL, an owner-only service-account
+credential, and a random webhook master secret of at least 32 bytes. The public
+URL must be an HTTPS origin without userinfo, port, path, query, or fragment. The
+callback is fixed to:
+
+`/api/v1/pmt/drive-notifications/bug-tracker`
+
+An explicit callback override is accepted only when it is that exact path on the
+same HTTPS origin. The service account OAuth token uses the pinned Google token
+endpoint and the least-privilege
+`https://www.googleapis.com/auth/drive.metadata.readonly` scope. Drive-triggered
+private CSV export uses a separate
+`https://www.googleapis.com/auth/spreadsheets.readonly` bearer token, sent only
+to the exact validated `https://docs.google.com` export URL. Redirects are never
+followed and never receive Authorization. Existing public/manual sync remains
+unauthenticated and read-only.
+
+After enabling configuration, no channel is created automatically. An
+authenticated administrator must explicitly Register from `/pmt/sync`; this
+persists the desired Running state. Stop first persists desired Stopped state,
+then disables local channels, so workers cannot recreate or renew them while the
+feature environment remains enabled. A later manual Register re-enables renewal.
+All mutations require CSRF.
+Watch channels cannot renew in place, so renewal creates an overlapping channel,
+activates it, then queues/stops the old one. Remote stop failures are persisted
+with bounded backoff and retried by worker maintenance. If watch creation returns
+enough channel/resource information but local validation or binding fails, PMT
+attempts immediate cleanup and persists retry state on failure. If Google never
+returns a usable resource ID, its requested provider expiration is the only
+remote cleanup fallback. The worker checks local SQLite
+due events and channel expiration during its normal recovery invocation. It does
+not poll Google Sheet content unless a durable notification event is due.
+
+Google callbacks are unauthenticated at the HTTP layer, but are authenticated by
+strict `X-Goog-*` channel metadata and a deterministic per-channel HMAC token.
+Only the token SHA-256 hash is persisted. `sync` callbacks are durably
+acknowledged without fetching CSV; `update` callbacks for content/properties are
+persisted, deduplicated, ordered, and coalesced for five seconds before one
+Shadow Sync. A late event received while the debounce runner is active is handled
+by that runner's durable follow-up loop. Failed work uses durable bounded backoff
+and can be recovered by a later worker invocation after restart. Worker
+maintenance prunes terminal notification history and old inactive channel rows
+after 30 days while preserving active/retriable state and a bounded recent
+channel history.
+
+Operational notes:
+
+- The callback must be publicly reachable over valid HTTPS before registration.
+- Google Drive API must be enabled and the service account must be able to read
+  the configured file metadata.
+- Keep the webhook secret stable across service restarts; changing it invalidates
+  callbacks for existing channels, which should then be replaced manually.
+- Status and run results deliberately omit channel tokens, credentials, OAuth
+  data, resource IDs, and provider response bodies.

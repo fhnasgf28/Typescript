@@ -14,6 +14,7 @@ from mcp_transfer_node.config import TransferSettings, load_settings
 from mcp_transfer_node.files import ensure_runtime_dirs
 from mcp_transfer_node.logging_config import configure_logging
 from mcp_transfer_node.pmt_api import create_pmt_api_router
+from mcp_transfer_node.pmt_drive import create_drive_notification_router
 from mcp_transfer_node.pmt_web import create_pmt_web_router
 from mcp_transfer_node.responses import error_response
 from mcp_transfer_node.web import create_web_router
@@ -55,6 +56,7 @@ def create_app(settings: TransferSettings | None = None) -> FastAPI:
 
     app.include_router(create_api_router(resolved))
     app.include_router(create_pmt_api_router(resolved))
+    app.include_router(create_drive_notification_router(resolved))
     app.include_router(create_pmt_web_router(resolved))
     app.include_router(create_web_router(resolved))
     return app

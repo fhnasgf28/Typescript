@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import hmac
 import json
 import re
 import sqlite3
@@ -62,6 +63,9 @@ AGENT_STATUS_TRANSITIONS = {
 }
 MAX_CONTEXT_DOCUMENTS_PER_TASK = 5
 MAX_CREATE_IDEMPOTENCY_KEY_LENGTH = 240
+MAX_DRIVE_EVENT_ATTEMPTS = 8
+MAX_DRIVE_CLEANUP_ATTEMPTS = 8
+SHEET_SYNC_LEASE_SECONDS = 90
 GOOGLE_DOC_TASK_DESCRIPTION = (
     "Task dibuat dari Google Docs context. Gunakan snapshot terlampir sebagai requirement utama."
 )
@@ -302,6 +306,62 @@ class PmtStore:
                     ON schedule_runs(schedule_id, started_at);
                 CREATE INDEX IF NOT EXISTS idx_schedules_due
                     ON schedules(enabled, next_run_at);
+                CREATE TABLE IF NOT EXISTS drive_watch_channels (
+                    channel_id TEXT PRIMARY KEY,
+                    file_id TEXT NOT NULL,
+                    token_hash TEXT NOT NULL,
+                    resource_id TEXT,
+                    resource_uri TEXT,
+                    expiration_at TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    replaced_by TEXT,
+                    last_message_number INTEGER,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_drive_channels_file_state
+                    ON drive_watch_channels(file_id,state,expiration_at);
+                CREATE TABLE IF NOT EXISTS drive_watch_leases (
+                    file_id TEXT PRIMARY KEY,
+                    locked_by TEXT NOT NULL,
+                    lock_expires_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS drive_watch_maintenance (
+                    file_id TEXT PRIMARY KEY,
+                    desired_active INTEGER NOT NULL DEFAULT 0,
+                    renewal_attempts INTEGER NOT NULL DEFAULT 0,
+                    renewal_next_attempt_at TEXT,
+                    last_status TEXT,
+                    last_error_type TEXT,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS drive_notification_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    channel_id TEXT NOT NULL REFERENCES drive_watch_channels(channel_id),
+                    message_number INTEGER NOT NULL,
+                    resource_state TEXT NOT NULL,
+                    received_at TEXT NOT NULL,
+                    available_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at TEXT NOT NULL,
+                    run_id TEXT,
+                    locked_by TEXT,
+                    lock_expires_at TEXT,
+                    finished_at TEXT,
+                    result TEXT NOT NULL DEFAULT '{}',
+                    UNIQUE(channel_id,message_number)
+                );
+                CREATE INDEX IF NOT EXISTS idx_drive_events_due
+                    ON drive_notification_events(status,next_attempt_at,available_at);
+                CREATE TABLE IF NOT EXISTS sheet_sync_leases (
+                    source_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    locked_by TEXT NOT NULL,
+                    lock_expires_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS approval_requests (
                     id TEXT PRIMARY KEY,
                     approval_key TEXT NOT NULL UNIQUE,
@@ -368,6 +428,17 @@ class PmtStore:
                 self._ensure_column(db, "agents", "mode", "TEXT NOT NULL DEFAULT 'active'")
                 self._ensure_column(db, "schedules", "current_run_id", "TEXT")
                 self._ensure_column(db, "approval_runs", "provider_key", "TEXT NOT NULL DEFAULT ''")
+                self._ensure_column(
+                    db, "drive_watch_maintenance", "desired_active", "INTEGER NOT NULL DEFAULT 0"
+                )
+                self._ensure_column(
+                    db, "drive_watch_channels", "cleanup_status", "TEXT NOT NULL DEFAULT 'none'"
+                )
+                self._ensure_column(
+                    db, "drive_watch_channels", "cleanup_attempts", "INTEGER NOT NULL DEFAULT 0"
+                )
+                self._ensure_column(db, "drive_watch_channels", "cleanup_next_attempt_at", "TEXT")
+                self._ensure_column(db, "drive_watch_channels", "cleanup_last_error_type", "TEXT")
                 self._migrate_active_task_runs(db)
             except Exception:
                 db.rollback()
@@ -2688,3 +2759,525 @@ class PmtStore:
                 raise PermissionError("schedule run fencing token is stale")
             updated = db.execute("SELECT * FROM schedules WHERE id=?", (schedule_id,)).fetchone()
             return self._schedule(updated)
+
+    def create_pending_drive_channel(
+        self, channel_id: str, file_id: str, token_hash: str, expiration_at: datetime
+    ) -> dict[str, Any]:
+        now = utcnow()
+        with self._transaction() as db:
+            db.execute(
+                """INSERT INTO drive_watch_channels(
+                    channel_id,file_id,token_hash,expiration_at,state,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?)""",
+                (
+                    channel_id,
+                    file_id,
+                    token_hash,
+                    expiration_at.isoformat(),
+                    "active",
+                    now.isoformat(),
+                    now.isoformat(),
+                ),
+            )
+            row = db.execute(
+                "SELECT * FROM drive_watch_channels WHERE channel_id=?", (channel_id,)
+            ).fetchone()
+        return dict(row)
+
+    def set_drive_watch_desired(self, file_id: str, desired: bool) -> None:
+        """Persist the administrator's lifecycle intent independently of environment config."""
+        now = iso()
+        with self._transaction() as db:
+            db.execute(
+                """INSERT INTO drive_watch_maintenance(file_id,desired_active,updated_at)
+                    VALUES(?,?,?) ON CONFLICT(file_id) DO UPDATE SET
+                    desired_active=excluded.desired_active,updated_at=excluded.updated_at""",
+                (file_id, int(desired), now),
+            )
+
+    def drive_watch_desired(self, file_id: str) -> bool:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT desired_active FROM drive_watch_maintenance WHERE file_id=?", (file_id,)
+            ).fetchone()
+        # An enabled environment is capability only. A new database remains stopped until
+        # an administrator explicitly registers a watch.
+        return bool(row and row["desired_active"])
+
+    def claim_drive_watch_lease(self, file_id: str, owner: str, lease_seconds: int = 300) -> bool:
+        now = utcnow()
+        with self._transaction() as db:
+            row = db.execute(
+                "SELECT * FROM drive_watch_leases WHERE file_id=?", (file_id,)
+            ).fetchone()
+            if row is not None and row["lock_expires_at"] > now.isoformat():
+                return False
+            db.execute(
+                """INSERT INTO drive_watch_leases(file_id,locked_by,lock_expires_at)
+                    VALUES(?,?,?) ON CONFLICT(file_id) DO UPDATE SET
+                    locked_by=excluded.locked_by,lock_expires_at=excluded.lock_expires_at""",
+                (
+                    file_id,
+                    owner,
+                    (now + timedelta(seconds=max(60, lease_seconds))).isoformat(),
+                ),
+            )
+        return True
+
+    def release_drive_watch_lease(self, file_id: str, owner: str) -> None:
+        with self._transaction() as db:
+            db.execute(
+                "DELETE FROM drive_watch_leases WHERE file_id=? AND locked_by=?", (file_id, owner)
+            )
+
+    def bind_drive_channel(
+        self,
+        channel_id: str,
+        resource_id: str,
+        resource_uri: str,
+        expiration_at: datetime,
+    ) -> dict[str, Any]:
+        with self._transaction() as db:
+            row = db.execute(
+                "SELECT * FROM drive_watch_channels WHERE channel_id=?", (channel_id,)
+            ).fetchone()
+            if row is None or row["state"] != "active":
+                raise KeyError(channel_id)
+            if row["resource_id"] not in {None, resource_id}:
+                raise ValueError("Drive channel resource binding changed")
+            cursor = db.execute(
+                """UPDATE drive_watch_channels SET resource_id=?,resource_uri=?,expiration_at=?,
+                    updated_at=? WHERE channel_id=? AND state='active'""",
+                (resource_id, resource_uri, expiration_at.isoformat(), iso(), channel_id),
+            )
+            if cursor.rowcount != 1:
+                raise PermissionError("Drive channel binding was fenced")
+            bound = db.execute(
+                "SELECT * FROM drive_watch_channels WHERE channel_id=?", (channel_id,)
+            ).fetchone()
+        return dict(bound)
+
+    def fail_pending_drive_channel(self, channel_id: str) -> None:
+        with self._transaction() as db:
+            db.execute(
+                """UPDATE drive_watch_channels SET state='stopped',updated_at=?
+                    WHERE channel_id=? AND resource_id IS NULL""",
+                (iso(), channel_id),
+            )
+
+    def mark_drive_channel_cleanup_needed(
+        self, channel_id: str, resource_id: str | None = None
+    ) -> None:
+        """Durably queue a remote channel stop without returning provider identifiers."""
+        with self._transaction() as db:
+            if resource_id is not None:
+                db.execute(
+                    """UPDATE drive_watch_channels SET resource_id=COALESCE(resource_id,?),
+                        state='stopped',cleanup_status='pending',cleanup_next_attempt_at=?,updated_at=?
+                        WHERE channel_id=?""",
+                    (resource_id, iso(), iso(), channel_id),
+                )
+            else:
+                db.execute(
+                    """UPDATE drive_watch_channels SET state='stopped',cleanup_status='pending',
+                        cleanup_next_attempt_at=?,updated_at=? WHERE channel_id=?
+                        AND resource_id IS NOT NULL""",
+                    (iso(), iso(), channel_id),
+                )
+
+    def due_drive_channel_cleanups(self, limit: int = 10) -> list[dict[str, Any]]:
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT channel_id,resource_id FROM drive_watch_channels
+                    WHERE cleanup_status IN ('pending','failed') AND resource_id IS NOT NULL
+                    AND cleanup_attempts<? AND cleanup_next_attempt_at<=?
+                    ORDER BY cleanup_next_attempt_at LIMIT ?""",
+                (MAX_DRIVE_CLEANUP_ATTEMPTS, iso(), max(1, min(limit, 50))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_drive_cleanup_result(
+        self, channel_id: str, *, success: bool, error_type: str = ""
+    ) -> None:
+        now = utcnow()
+        with self._transaction() as db:
+            row = db.execute(
+                "SELECT cleanup_attempts FROM drive_watch_channels WHERE channel_id=?",
+                (channel_id,),
+            ).fetchone()
+            if row is None:
+                return
+            attempts = int(row["cleanup_attempts"]) + 1
+            exhausted = not success and attempts >= MAX_DRIVE_CLEANUP_ATTEMPTS
+            delay = min(3600, 60 * (2 ** min(max(attempts - 1, 0), 6)))
+            db.execute(
+                """UPDATE drive_watch_channels SET cleanup_status=?,cleanup_attempts=?,
+                    cleanup_next_attempt_at=?,cleanup_last_error_type=?,updated_at=?
+                    WHERE channel_id=?""",
+                (
+                    "succeeded" if success else ("exhausted" if exhausted else "failed"),
+                    attempts,
+                    None if success or exhausted else (now + timedelta(seconds=delay)).isoformat(),
+                    "" if success else error_type[:120],
+                    now.isoformat(),
+                    channel_id,
+                ),
+            )
+
+    def replace_drive_channels(self, file_id: str, new_channel_id: str) -> list[dict[str, Any]]:
+        with self._transaction() as db:
+            rows = db.execute(
+                """SELECT * FROM drive_watch_channels WHERE file_id=? AND state='active'
+                    AND channel_id<>? AND resource_id IS NOT NULL""",
+                (file_id, new_channel_id),
+            ).fetchall()
+            db.execute(
+                """UPDATE drive_watch_channels SET state='replaced',replaced_by=?,
+                    cleanup_status='pending',cleanup_next_attempt_at=?,updated_at=?
+                    WHERE file_id=? AND state='active' AND channel_id<>?
+                    AND resource_id IS NOT NULL""",
+                (new_channel_id, iso(), iso(), file_id, new_channel_id),
+            )
+        return [dict(row) for row in rows]
+
+    def stop_drive_channel(self, channel_id: str) -> dict[str, Any]:
+        with self._transaction() as db:
+            row = db.execute(
+                "SELECT * FROM drive_watch_channels WHERE channel_id=?", (channel_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(channel_id)
+            db.execute(
+                """UPDATE drive_watch_channels SET state='stopped',cleanup_status=CASE
+                    WHEN resource_id IS NULL THEN cleanup_status ELSE 'pending' END,
+                    cleanup_next_attempt_at=CASE WHEN resource_id IS NULL THEN cleanup_next_attempt_at
+                    ELSE ? END,updated_at=? WHERE channel_id=?""",
+                (iso(), iso(), channel_id),
+            )
+        return dict(row)
+
+    def drive_watch_status(self, file_id: str) -> dict[str, Any]:
+        now = utcnow().isoformat()
+        with self._transaction() as db:
+            db.execute(
+                """UPDATE drive_watch_channels SET state='expired',updated_at=?
+                    WHERE file_id=? AND state='active' AND expiration_at<=?""",
+                (now, file_id, now),
+            )
+            rows = db.execute(
+                """SELECT channel_id,state,expiration_at,resource_id IS NOT NULL AS bound,
+                    cleanup_status,last_message_number,created_at,updated_at FROM drive_watch_channels
+                    WHERE file_id=? ORDER BY created_at DESC LIMIT 20""",
+                (file_id,),
+            ).fetchall()
+            pending = db.execute(
+                """SELECT e.status,COUNT(*) AS count FROM drive_notification_events e
+                    JOIN drive_watch_channels c ON c.channel_id=e.channel_id
+                    WHERE c.file_id=? GROUP BY e.status""",
+                (file_id,),
+            ).fetchall()
+        return {
+            "channels": [dict(row) for row in rows],
+            "events": {row["status"]: row["count"] for row in pending},
+            "desired_active": self.drive_watch_desired(file_id),
+        }
+
+    def get_drive_channel(self, channel_id: str) -> dict[str, Any] | None:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM drive_watch_channels WHERE channel_id=?", (channel_id,)
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def record_drive_notification(
+        self,
+        channel_id: str,
+        token_hash: str,
+        resource_id: str,
+        message_number: int,
+        resource_state: str,
+    ) -> str:
+        now = utcnow()
+        with self._transaction() as db:
+            row = db.execute(
+                "SELECT * FROM drive_watch_channels WHERE channel_id=?", (channel_id,)
+            ).fetchone()
+            if row is None or row["state"] != "active" or row["expiration_at"] <= now.isoformat():
+                raise PermissionError("Drive channel is unknown or inactive")
+            if not hmac.compare_digest(row["token_hash"], token_hash):
+                raise PermissionError("Drive channel token is invalid")
+            if row["resource_id"] is None:
+                if resource_state != "sync" or message_number != 1:
+                    raise PermissionError("Drive channel resource is not bound")
+            elif not hmac.compare_digest(row["resource_id"], resource_id):
+                raise PermissionError("Drive resource does not match the channel")
+            existing = db.execute(
+                """SELECT 1 FROM drive_notification_events
+                    WHERE channel_id=? AND message_number=?""",
+                (channel_id, message_number),
+            ).fetchone()
+            if existing:
+                return "duplicate"
+            last_number = row["last_message_number"]
+            if last_number is not None and message_number <= last_number:
+                raise PermissionError("Drive message number is out of order")
+            event_status = "ignored" if resource_state == "sync" else "pending"
+            available = now if event_status == "ignored" else now + timedelta(seconds=5)
+            db.execute(
+                """INSERT INTO drive_notification_events(
+                    channel_id,message_number,resource_state,received_at,available_at,status,
+                    next_attempt_at,finished_at,result
+                ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                (
+                    channel_id,
+                    message_number,
+                    resource_state,
+                    now.isoformat(),
+                    available.isoformat(),
+                    event_status,
+                    available.isoformat(),
+                    now.isoformat() if event_status == "ignored" else None,
+                    json.dumps({"action": "acknowledged"}) if event_status == "ignored" else "{}",
+                ),
+            )
+            db.execute(
+                """UPDATE drive_watch_channels SET last_message_number=?,updated_at=?
+                    WHERE channel_id=?""",
+                (message_number, now.isoformat(), channel_id),
+            )
+        return event_status
+
+    def claim_drive_events(self, worker_id: str, lease_seconds: int = 300) -> dict[str, Any] | None:
+        now = utcnow()
+        with self._transaction() as db:
+            db.execute(
+                """UPDATE drive_notification_events SET status='failed',run_id=NULL,locked_by=NULL,
+                    lock_expires_at=NULL,next_attempt_at=? WHERE status='running'
+                    AND lock_expires_at<=?""",
+                (now.isoformat(), now.isoformat()),
+            )
+            running = db.execute(
+                "SELECT 1 FROM drive_notification_events WHERE status='running' LIMIT 1"
+            ).fetchone()
+            if running:
+                return None
+            rows = db.execute(
+                """SELECT e.id,c.file_id FROM drive_notification_events e
+                    JOIN drive_watch_channels c ON c.channel_id=e.channel_id
+                    WHERE e.status IN ('pending','failed') AND e.available_at<=?
+                    AND e.next_attempt_at<=? ORDER BY e.received_at,e.id""",
+                (now.isoformat(), now.isoformat()),
+            ).fetchall()
+            if not rows:
+                return None
+            file_id = rows[0]["file_id"]
+            ids = [row["id"] for row in rows if row["file_id"] == file_id]
+            run_id = f"drive_run_{uuid.uuid4().hex}"
+            placeholders = ",".join("?" for _ in ids)
+            db.execute(
+                f"""UPDATE drive_notification_events SET status='running',attempts=attempts+1,
+                    run_id=?,locked_by=?,lock_expires_at=? WHERE id IN ({placeholders})""",
+                (
+                    run_id,
+                    worker_id,
+                    (now + timedelta(seconds=max(60, lease_seconds))).isoformat(),
+                    *ids,
+                ),
+            )
+        return {"run_id": run_id, "file_id": file_id, "event_ids": ids}
+
+    def defer_drive_events_busy(self, run_id: str, worker_id: str, delay_seconds: int = 5) -> int:
+        """Return a busy Drive batch to pending without consuming a failure attempt."""
+        with self._transaction() as db:
+            cursor = db.execute(
+                """UPDATE drive_notification_events SET status='pending',attempts=MAX(attempts-1,0),
+                    next_attempt_at=?,run_id=NULL,locked_by=NULL,lock_expires_at=NULL
+                    WHERE status='running' AND run_id=? AND locked_by=?""",
+                (
+                    (utcnow() + timedelta(seconds=max(1, delay_seconds))).isoformat(),
+                    run_id,
+                    worker_id,
+                ),
+            )
+        return cursor.rowcount
+
+    def next_drive_event_delay(self, maximum_seconds: float = 5.0) -> float | None:
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT MIN(CASE WHEN available_at>next_attempt_at THEN available_at
+                    ELSE next_attempt_at END) AS due_at FROM drive_notification_events
+                    WHERE status='pending'"""
+            ).fetchone()
+        if row is None or row["due_at"] is None:
+            return None
+        delay = (datetime.fromisoformat(row["due_at"]) - utcnow()).total_seconds()
+        return max(0.05, min(maximum_seconds, delay))
+
+    def finish_drive_events(
+        self, run_id: str, worker_id: str, *, success: bool, result: dict[str, Any]
+    ) -> int:
+        now = utcnow()
+        with self._transaction() as db:
+            rows = db.execute(
+                """SELECT id,attempts FROM drive_notification_events WHERE status='running'
+                    AND run_id=? AND locked_by=?""",
+                (run_id, worker_id),
+            ).fetchall()
+            if not rows:
+                raise PermissionError("Drive event run is stale")
+            for row in rows:
+                if success:
+                    db.execute(
+                        """UPDATE drive_notification_events SET status='succeeded',finished_at=?,
+                            result=?,run_id=NULL,locked_by=NULL,lock_expires_at=NULL WHERE id=?""",
+                        (now.isoformat(), json.dumps(result), row["id"]),
+                    )
+                elif row["attempts"] >= MAX_DRIVE_EVENT_ATTEMPTS:
+                    db.execute(
+                        """UPDATE drive_notification_events SET status='exhausted',finished_at=?,
+                            result=?,run_id=NULL,locked_by=NULL,lock_expires_at=NULL WHERE id=?""",
+                        (now.isoformat(), json.dumps(result), row["id"]),
+                    )
+                else:
+                    delay = min(3600, 60 * (2 ** min(row["attempts"] - 1, 6)))
+                    db.execute(
+                        """UPDATE drive_notification_events SET status='failed',next_attempt_at=?,
+                            result=?,run_id=NULL,locked_by=NULL,lock_expires_at=NULL WHERE id=?""",
+                        (
+                            (now + timedelta(seconds=delay)).isoformat(),
+                            json.dumps(result),
+                            row["id"],
+                        ),
+                    )
+        return len(rows)
+
+    def due_drive_renewal(self, file_id: str, overlap_seconds: int = 600) -> bool:
+        threshold = (utcnow() + timedelta(seconds=overlap_seconds)).isoformat()
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT 1 FROM drive_watch_channels WHERE file_id=? AND state='active'
+                    AND resource_id IS NOT NULL AND expiration_at>? LIMIT 1""",
+                (file_id, threshold),
+            ).fetchone()
+        return row is None
+
+    def drive_renewal_retry_due(self, file_id: str) -> bool:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT renewal_next_attempt_at FROM drive_watch_maintenance WHERE file_id=?",
+                (file_id,),
+            ).fetchone()
+        return (
+            row is None
+            or row["renewal_next_attempt_at"] is None
+            or row["renewal_next_attempt_at"] <= iso()
+        )
+
+    def record_drive_renewal_result(
+        self, file_id: str, *, success: bool, error_type: str = ""
+    ) -> None:
+        now = utcnow()
+        with self._transaction() as db:
+            row = db.execute(
+                "SELECT renewal_attempts FROM drive_watch_maintenance WHERE file_id=?",
+                (file_id,),
+            ).fetchone()
+            attempts = 0 if success else (int(row["renewal_attempts"]) if row else 0) + 1
+            delay = min(3600, 60 * (2 ** min(max(attempts - 1, 0), 6)))
+            next_attempt = None if success else (now + timedelta(seconds=delay)).isoformat()
+            db.execute(
+                """INSERT INTO drive_watch_maintenance(
+                    file_id,renewal_attempts,renewal_next_attempt_at,last_status,last_error_type,
+                    updated_at
+                ) VALUES(?,?,?,?,?,?) ON CONFLICT(file_id) DO UPDATE SET
+                    renewal_attempts=excluded.renewal_attempts,
+                    renewal_next_attempt_at=excluded.renewal_next_attempt_at,
+                    last_status=excluded.last_status,last_error_type=excluded.last_error_type,
+                    updated_at=excluded.updated_at""",
+                (
+                    file_id,
+                    attempts,
+                    next_attempt,
+                    "succeeded" if success else "failed",
+                    "" if success else error_type[:120],
+                    now.isoformat(),
+                ),
+            )
+
+    def claim_sheet_sync_lease(
+        self, source_id: str, owner: str, run_id: str, lease_seconds: int = SHEET_SYNC_LEASE_SECONDS
+    ) -> bool:
+        now = utcnow()
+        with self._transaction() as db:
+            row = db.execute(
+                "SELECT lock_expires_at FROM sheet_sync_leases WHERE source_id=?", (source_id,)
+            ).fetchone()
+            if row is not None and row["lock_expires_at"] > now.isoformat():
+                return False
+            db.execute(
+                """INSERT INTO sheet_sync_leases(
+                    source_id,run_id,locked_by,lock_expires_at,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?) ON CONFLICT(source_id) DO UPDATE SET
+                    run_id=excluded.run_id,locked_by=excluded.locked_by,
+                    lock_expires_at=excluded.lock_expires_at,updated_at=excluded.updated_at""",
+                (
+                    source_id,
+                    run_id,
+                    owner,
+                    (
+                        now + timedelta(seconds=max(SHEET_SYNC_LEASE_SECONDS, lease_seconds))
+                    ).isoformat(),
+                    now.isoformat(),
+                    now.isoformat(),
+                ),
+            )
+        return True
+
+    def assert_sheet_sync_lease(self, source_id: str, owner: str, run_id: str) -> None:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM sheet_sync_leases WHERE source_id=?", (source_id,)
+            ).fetchone()
+        if (
+            row is None
+            or row["locked_by"] != owner
+            or row["run_id"] != run_id
+            or row["lock_expires_at"] <= iso()
+        ):
+            raise LeaseExpiredError("Sheet sync lease is stale")
+
+    def release_sheet_sync_lease(self, source_id: str, owner: str, run_id: str) -> None:
+        with self._transaction() as db:
+            db.execute(
+                """DELETE FROM sheet_sync_leases WHERE source_id=? AND locked_by=? AND run_id=?""",
+                (source_id, owner, run_id),
+            )
+
+    def prune_drive_history(
+        self, retention_days: int = 30, keep_channels: int = 100
+    ) -> dict[str, int]:
+        """Bound terminal webhook history while retaining active/retriable state."""
+        cutoff = (utcnow() - timedelta(days=max(1, retention_days))).isoformat()
+        with self._transaction() as db:
+            events = db.execute(
+                """DELETE FROM drive_notification_events WHERE status IN
+                    ('succeeded','ignored','exhausted') AND finished_at<?""",
+                (cutoff,),
+            ).rowcount
+            stale_ids = db.execute(
+                """SELECT channel_id FROM drive_watch_channels WHERE state IN
+                    ('stopped','replaced','expired') AND cleanup_status IN ('none','succeeded','exhausted')
+                    AND updated_at<? ORDER BY updated_at DESC LIMIT -1 OFFSET ?""",
+                (cutoff, max(1, keep_channels)),
+            ).fetchall()
+            channels = 0
+            if stale_ids:
+                ids = [row["channel_id"] for row in stale_ids]
+                marks = ",".join("?" for _ in ids)
+                db.execute(
+                    f"DELETE FROM drive_notification_events WHERE channel_id IN ({marks})", ids
+                )
+                channels = db.execute(
+                    f"DELETE FROM drive_watch_channels WHERE channel_id IN ({marks})", ids
+                ).rowcount
+        return {"events": events, "channels": channels}

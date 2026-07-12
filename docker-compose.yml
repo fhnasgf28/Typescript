@@ -23,5 +23,25 @@ services:
     cap_drop:
       - ALL
 
+  pmt-worker:
+    build: .
+    profiles: ["worker"]
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      MCP_TRANSFER_HOME_ALLOWLIST_PREFIX: /data
+      MCP_TRANSFER_BASE_DIR: /data/runtime
+    command:
+      - /bin/sh
+      - -c
+      - "while true; do python -m mcp_transfer_node.pmt_worker --worker-id docker-pmt-worker; sleep 60; done"
+    volumes:
+      - pmt-data:/data/runtime
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
 volumes:
   pmt-data:

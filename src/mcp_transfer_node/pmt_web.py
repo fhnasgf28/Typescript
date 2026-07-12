@@ -17,6 +17,11 @@ from mcp_transfer_node.pmt_context import (
     GOOGLE_DOC_TASK_DESCRIPTION,
 )
 from mcp_transfer_node.pmt_gdocs import GoogleDocsError, read_google_doc
+from mcp_transfer_node.pmt_drive import (
+    DriveWatchError,
+    register_drive_watch,
+    stop_active_drive_watches,
+)
 from mcp_transfer_node.pmt_present import build_bounded_web_context as _bounded_web_context
 from mcp_transfer_node.pmt_sheet import validate_sheet_url
 from mcp_transfer_node.pmt_store import (
@@ -379,9 +384,47 @@ def create_pmt_web_router(
                 "settings": settings,
                 "schedules": schedules,
                 "runs": store.list_schedule_runs(limit=50),
+                "drive_watch": store.drive_watch_status(settings.pmt_drive_spreadsheet_id)
+                if settings.pmt_drive_spreadsheet_id
+                else {"channels": [], "events": {}, "desired_active": False},
                 "csrf_token": request.session["csrf_token"],
             },
         )
+
+    @router.get("/sync/drive-watch/status")
+    def drive_watch_status(request: Request) -> dict[str, Any]:
+        _require_login(request)
+        return {
+            "enabled": settings.pmt_drive_watch_enabled,
+            **(
+                store.drive_watch_status(settings.pmt_drive_spreadsheet_id)
+                if settings.pmt_drive_spreadsheet_id
+                else {"channels": [], "events": {}, "desired_active": False}
+            ),
+        }
+
+    @router.post("/sync/drive-watch/register")
+    @router.post("/sync/drive-watch/renew")
+    async def register_or_renew_drive_watch(
+        request: Request, csrf_token: str = Form(...)
+    ) -> RedirectResponse:
+        _require_login(request)
+        _require_csrf(request, csrf_token)
+        try:
+            await register_drive_watch(store, settings)
+        except DriveWatchError as exc:
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+        return RedirectResponse("/pmt/sync", status_code=status.HTTP_303_SEE_OTHER)
+
+    @router.post("/sync/drive-watch/stop")
+    async def stop_drive_watch(request: Request, csrf_token: str = Form(...)) -> RedirectResponse:
+        _require_login(request)
+        _require_csrf(request, csrf_token)
+        try:
+            await stop_active_drive_watches(store, settings)
+        except DriveWatchError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        return RedirectResponse("/pmt/sync", status_code=status.HTTP_303_SEE_OTHER)
 
     @router.post("/sync/schedules")
     def create_sync_schedule(
