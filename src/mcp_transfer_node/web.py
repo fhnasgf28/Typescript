@@ -52,14 +52,19 @@ def create_web_router(settings: TransferSettings) -> APIRouter:
             )
 
         request.session["authenticated"] = True
-        return RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
+        return RedirectResponse("/pmt", status_code=status.HTTP_303_SEE_OTHER)
 
     @router.post("/logout")
     def logout(request: Request) -> RedirectResponse:
         request.session.clear()
         return RedirectResponse("/login", status_code=status.HTTP_303_SEE_OTHER)
 
-    @router.get("/", response_class=HTMLResponse)
+    @router.get("/")
+    def home(request: Request) -> RedirectResponse:
+        _require_login(request)
+        return RedirectResponse("/pmt", status_code=status.HTTP_303_SEE_OTHER)
+
+    @router.get("/transfer", response_class=HTMLResponse)
     def index(request: Request):
         _require_login(request)
         records = [
@@ -124,7 +129,7 @@ def create_web_router(settings: TransferSettings) -> APIRouter:
                     status="received",
                 ),
             )
-            return RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
+            return RedirectResponse("/transfer", status_code=status.HTTP_303_SEE_OTHER)
         finally:
             if temp_path.exists():
                 temp_path.unlink()
@@ -156,6 +161,6 @@ def create_web_router(settings: TransferSettings) -> APIRouter:
             if path.exists():
                 path.unlink()
             mark_deleted(_metadata_path(settings), transfer_id)
-        return RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
+        return RedirectResponse("/transfer", status_code=status.HTTP_303_SEE_OTHER)
 
     return router

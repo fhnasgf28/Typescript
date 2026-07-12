@@ -34,8 +34,27 @@ def test_wrong_password_stays_on_login(client: TestClient) -> None:
     assert "Login gagal" in response.text
 
 
-def test_correct_password_opens_inbox(client: TestClient) -> None:
+def test_correct_password_opens_pmt_dashboard(client: TestClient) -> None:
     response = client.post("/login", data={"password": "admin-password"}, follow_redirects=True)
+
+    assert response.status_code == 200
+    assert response.url.path == "/pmt"
+    assert "Task Dashboard" in response.text
+
+
+def test_authenticated_root_redirects_to_pmt(client: TestClient) -> None:
+    client.post("/login", data={"password": "admin-password"})
+
+    response = client.get("/", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/pmt"
+
+
+def test_transfer_inbox_remains_available(client: TestClient) -> None:
+    client.post("/login", data={"password": "admin-password"})
+
+    response = client.get("/transfer")
 
     assert response.status_code == 200
     assert "MCP Transfer Node - server-b" in response.text
