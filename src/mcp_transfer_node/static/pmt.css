@@ -341,6 +341,22 @@ body.pmt-body {
   font-family: var(--bs-font-monospace);
 }
 
+.pmt-wrap-anywhere {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.pmt-context-content {
+  max-width: 100%;
+  max-height: 32rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  font: inherit;
+  font-size: .875rem;
+}
+
 .pmt-responsive-table { overflow-x: auto; }
 .pmt-responsive-table .table { min-width: 42rem; }
 

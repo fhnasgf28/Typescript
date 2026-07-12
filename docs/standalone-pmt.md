@@ -13,6 +13,7 @@ The MVP is deliberately small:
 - atomic task claim, fenced run token, bounded lease, heartbeat, idempotency, expiry reconciliation, and audit events
 - durable interval schedules with worker leases
 - a bounded Google Sheet `To-Do` importer
+- bounded, deterministic, read-only Google Docs multi-tab task context snapshots
 - immutable approval requests, named human decisions, fenced execution attempts, idempotency, expiry recovery, and approval audit events
 
 It does **not** push branches, create merge requests, retry pipelines, send chat messages, deploy, or write task status back to Google Sheet. Sprint 2B models and gates those actions, but deliberately ships no mutating connector.
@@ -73,7 +74,7 @@ Example central `peers.json`:
       "name": "openclaw-server-a",
       "tokenHash": "<sha256-token-hash>",
       "enabled": true,
-      "scopes": ["approval.execute:git_push"]
+      "scopes": ["approval.execute:git_push", "pmt.context.read"]
     },
     {
       "name": "openclaw-server-b",
@@ -96,6 +97,8 @@ Rules:
 The REST API prevents identity spoofing: request body `agent_id` must match `X-PMT-Agent` and the bearer-token peer name. Approval execution additionally requires both a registered active-agent capability and a configured peer scope: `approval.execute` or `approval.execute:<action_type>`. An agent cannot self-grant this authority through registration.
 
 Approval execution scopes are enforced now. Broader endpoint-level RBAC and short-lived service tokens remain planned hardening items, so peer credentials should still be granted only to trusted OpenClaw instances.
+
+Google Docs context is separately fail-closed. `pmt.context.read` permits snapshot reads; `pmt.context.refresh` permits attach/refresh/remove only when the authenticated agent also owns the active fenced task run. Existing peers without these explicit scopes gain no context authority.
 
 ## Run the central service
 
@@ -175,6 +178,8 @@ Read/context:
 - `pmt_get_my_tasks`
 - `pmt_get_task`
 - `pmt_get_task_context`
+- `pmt_list_task_context`
+- `pmt_get_context_document`
 - `pmt_get_agents`
 - `pmt_agent_heartbeat`
 - `pmt_get_schedules`
@@ -195,6 +200,9 @@ Task writes:
 - `pmt_report_blocker`
 - `pmt_submit_for_review`
 - `pmt_release_task`
+- `pmt_attach_google_doc_context`
+- `pmt_refresh_google_doc_context`
+- `pmt_remove_google_doc_context`
 
 Schedule writes:
 
@@ -321,6 +329,29 @@ The human reviews the exact payload at `/pmt/approvals`, types the displayed `AP
 The design addresses duplicate agents, stale task owners, concurrent human decisions, stale executors, request replay, accidental payload changes, CSRF on approval decisions, self-approved requests, self-granted execution capability, secret material in approval JSON, and schedule-based bypass of the approval queue.
 
 The current release does not claim to protect against a compromised PMT host/database administrator, a stolen human password/session, a stolen already-scoped peer token, or a malicious external provider. It does not provide OIDC, multi-role project authorization, cryptographic append-only audit storage, credential brokerage, connector-side rollback, or exactly-once guarantees from external providers. Executors must use `provider_key` as the provider-side idempotency key when a future connector supports one.
+
+## Google Docs task context
+
+An authenticated administrator or an actively owning agent can attach a canonical URL of the form `https://docs.google.com/document/d/<id>/edit?tab=<tab-id>`. PMT fetches `GET https://docs.googleapis.com/v1/documents/<id>?includeTabsContent=true` with the sole OAuth scope `https://www.googleapis.com/auth/documents.readonly`. It never uses `google-api-python-client`, write scopes, arbitrary hosts, redirects, HTML export scraping, or implicit background refresh.
+
+Server-owner configuration:
+
+```dotenv
+MCP_PMT_GOOGLE_DOCS_SERVICE_ACCOUNT_FILE=/absolute/owner-only/service-account.json
+MCP_PMT_GOOGLE_DOCS_TIMEOUT_SECONDS=30
+```
+
+The credential must be a regular file with no group/world permission bits. Its path and contents are never returned by API/UI or written to events. If the setting/file is absent or unsafe, Google Docs attach/refresh fails closed. The Google Cloud project must have `docs.googleapis.com` enabled and the service account must be able to read the document. A `403 SERVICE_DISABLED` means the Google Docs API still needs enabling (or propagation time); it is not evidence that PMT needs broader OAuth permissions.
+
+Snapshots preserve deterministic depth-first tab/subtab hierarchy, selected tab, headings, paragraphs, bullets, tables, and links. Limits are 100 tabs, 100,000 extracted characters per tab, 500,000 total characters, a 5 MiB API response, bounded nesting, and a 3–60 second timeout. Duplicate tab IDs, inconsistent parents, malformed payloads, non-JSON responses, redirects, userinfo, custom ports, and non-canonical hosts are rejected.
+
+`task_context_documents.context_version` is independent of `tasks.version`. Network I/O occurs outside SQLite. Authorization, active owner, run fencing, and observed task version are checked before fetch and again in the final transaction. Changed snapshots atomically replace all tab rows and require the observed context version. An identical hash retry only updates `last_checked_at`, including when its context-version observation became stale; task version never increments. Attach/remove/refresh events contain metadata and hashes only, never document text.
+
+### Untrusted-content boundary
+
+Every REST/MCP context pack includes a machine-readable `untrusted_external_content` boundary and an explicit text warning. Google Docs text is data/evidence only. It cannot override system/developer/project policy, authorize a tool, approve an external mutation, request command execution, disclose credentials, or bypass the Approval Center. Jinja autoescaping is retained in Task Detail and document text is rendered as plain pre-wrapped text.
+
+Explicit non-goals: editing Google Docs, write scopes, comments/Drive traversal, following links found in documents, executing embedded instructions, automatic scheduler refresh, storing OAuth tokens, or using document content as authorization. API enablement/access remains an operator prerequisite, not something PMT changes automatically.
 
 ## Google Sheet schedule
 

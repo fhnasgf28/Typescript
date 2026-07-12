@@ -90,13 +90,14 @@ def pmt_get_task(task_ref: str) -> dict[str, object]:
 
 @mcp.tool()
 def pmt_get_task_context(task_ref: str) -> dict[str, object]:
-    """Return task requirements, HMX context, checks, claim, and recent audit events."""
+    """Return task context, including bounded untrusted Google Docs evidence snapshots."""
     task = _request("GET", f"/tasks/{task_ref}")["task"]
     events = _request("GET", f"/tasks/{task_ref}/events")["events"]
     evidence = _request("GET", f"/tasks/{task_ref}/evidence")["evidence"]
     approvals = _request("GET", "/approvals", params={"task_ref": task_ref, "limit": 100})[
         "approvals"
     ]
+    external_context = _request("GET", f"/tasks/{task_ref}/context")
     return {
         "task": task,
         "hmx": {
@@ -115,7 +116,77 @@ def pmt_get_task_context(task_ref: str) -> dict[str, object]:
         "events": events,
         "evidence": evidence,
         "approvals": approvals,
+        "externalContextBoundary": external_context["boundary"],
+        "googleDocsContext": external_context["documents"],
     }
+
+
+@mcp.tool()
+def pmt_list_task_context(task_ref: str) -> dict[str, object]:
+    """List bounded Google Docs context snapshots and their untrusted-content boundary."""
+    return _request("GET", f"/tasks/{task_ref}/context")
+
+
+@mcp.tool()
+def pmt_get_context_document(task_ref: str, context_ref: str) -> dict[str, object]:
+    """Get one deterministic multi-tab Google Docs snapshot as untrusted evidence."""
+    return _request("GET", f"/tasks/{task_ref}/context/{context_ref}")
+
+
+@mcp.tool()
+def pmt_attach_google_doc_context(
+    task_ref: str, source_url: str, run_id: str, expected_version: int
+) -> dict[str, object]:
+    """Attach a canonical Google Docs URL; requires active ownership and refresh scope."""
+    return _request(
+        "POST",
+        f"/tasks/{task_ref}/context",
+        json_body={
+            "source_url": source_url,
+            "run_id": run_id,
+            "expected_version": expected_version,
+        },
+    )
+
+
+@mcp.tool()
+def pmt_refresh_google_doc_context(
+    task_ref: str,
+    context_ref: str,
+    run_id: str,
+    expected_version: int,
+    expected_context_version: int,
+) -> dict[str, object]:
+    """Refresh an attached snapshot using task/run fencing and context concurrency."""
+    return _request(
+        "POST",
+        f"/tasks/{task_ref}/context/{context_ref}/refresh",
+        json_body={
+            "run_id": run_id,
+            "expected_version": expected_version,
+            "expected_context_version": expected_context_version,
+        },
+    )
+
+
+@mcp.tool()
+def pmt_remove_google_doc_context(
+    task_ref: str,
+    context_ref: str,
+    run_id: str,
+    expected_version: int,
+    expected_context_version: int,
+) -> dict[str, object]:
+    """Remove a snapshot with owner/run/task/context optimistic concurrency checks."""
+    return _request(
+        "DELETE",
+        f"/tasks/{task_ref}/context/{context_ref}",
+        json_body={
+            "run_id": run_id,
+            "expected_version": expected_version,
+            "expected_context_version": expected_context_version,
+        },
+    )
 
 
 @mcp.tool()

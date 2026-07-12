@@ -62,6 +62,34 @@ def test_load_settings_accepts_custom_home_allowlist_prefix(tmp_path: Path) -> N
     assert settings.base_dir == base_dir
 
 
+def test_load_settings_google_docs_is_optional_and_bounded(tmp_path: Path) -> None:
+    base = {
+        "MCP_TRANSFER_SERVER_NAME": "server-b",
+        "MCP_TRANSFER_HOME_ALLOWLIST_PREFIX": str(tmp_path),
+        "MCP_TRANSFER_BASE_DIR": str(tmp_path / "runtime"),
+        "MCP_TRANSFER_WEB_ADMIN_PASSWORD": "admin-password",
+        "MCP_TRANSFER_SESSION_SECRET": "session-secret-with-more-than-32-chars",
+        "MCP_TRANSFER_PUBLIC_URL": "https://server-b.clipperyt.online",
+    }
+    assert load_settings(base).google_docs_service_account_file is None
+
+    credential = tmp_path / "owner-only.json"
+    configured = load_settings(
+        {
+            **base,
+            "MCP_PMT_GOOGLE_DOCS_SERVICE_ACCOUNT_FILE": str(credential),
+            "MCP_PMT_GOOGLE_DOCS_TIMEOUT_SECONDS": "12.5",
+        }
+    )
+    assert configured.google_docs_service_account_file == credential
+    assert configured.google_docs_timeout_seconds == 12.5
+
+    with pytest.raises(ValueError, match="absolute path"):
+        load_settings({**base, "MCP_PMT_GOOGLE_DOCS_SERVICE_ACCOUNT_FILE": "relative.json"})
+    with pytest.raises(ValueError, match="between 3 and 60"):
+        load_settings({**base, "MCP_PMT_GOOGLE_DOCS_TIMEOUT_SECONDS": "61"})
+
+
 def test_load_destinations_reads_aliases(tmp_path: Path) -> None:
     config_path = tmp_path / "destinations.json"
     config_path.write_text(

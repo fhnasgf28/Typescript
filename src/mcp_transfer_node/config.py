@@ -20,6 +20,8 @@ class TransferSettings:
     web_admin_password: str
     session_secret: str
     web_admin_username: str = "admin"
+    google_docs_service_account_file: Path | None = None
+    google_docs_timeout_seconds: float = 30.0
 
     @property
     def inbox_dir(self) -> Path:
@@ -108,6 +110,20 @@ def load_settings(env: Mapping[str, str] | None = None) -> TransferSettings:
     if max_file_mb < 1 or max_file_mb > 50:
         raise ValueError("max file size must be between 1 and 50 MB")
 
+    docs_credential_raw = source.get("MCP_PMT_GOOGLE_DOCS_SERVICE_ACCOUNT_FILE", "").strip()
+    docs_credential: Path | None = None
+    if docs_credential_raw:
+        candidate = Path(docs_credential_raw).expanduser()
+        if not candidate.is_absolute():
+            raise ValueError("MCP_PMT_GOOGLE_DOCS_SERVICE_ACCOUNT_FILE must be an absolute path")
+        docs_credential = candidate.resolve()
+    try:
+        docs_timeout = float(source.get("MCP_PMT_GOOGLE_DOCS_TIMEOUT_SECONDS", "30"))
+    except ValueError as exc:
+        raise ValueError("MCP_PMT_GOOGLE_DOCS_TIMEOUT_SECONDS must be a number") from exc
+    if not 3 <= docs_timeout <= 60:
+        raise ValueError("MCP_PMT_GOOGLE_DOCS_TIMEOUT_SECONDS must be between 3 and 60")
+
     return TransferSettings(
         server_name=_env_value(source, "MCP_TRANSFER_SERVER_NAME"),
         base_dir=_load_base_dir(source),
@@ -117,6 +133,8 @@ def load_settings(env: Mapping[str, str] | None = None) -> TransferSettings:
         session_secret=_env_value(source, "MCP_TRANSFER_SESSION_SECRET"),
         web_admin_username=source.get("MCP_TRANSFER_WEB_ADMIN_USERNAME", "admin").strip()
         or "admin",
+        google_docs_service_account_file=docs_credential,
+        google_docs_timeout_seconds=docs_timeout,
     )
 
 

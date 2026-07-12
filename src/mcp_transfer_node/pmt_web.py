@@ -9,6 +9,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from mcp_transfer_node.config import TransferSettings
+from mcp_transfer_node.pmt_context import GoogleDocsContextService, GoogleDocsFetcher
+from mcp_transfer_node.pmt_gdocs import read_google_doc
 from mcp_transfer_node.pmt_sheet import validate_sheet_url
 from mcp_transfer_node.pmt_store import (
     ADMIN_STATUS_TRANSITIONS,
@@ -41,9 +43,14 @@ def _require_csrf(request: Request, token: str) -> None:
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail="CSRF token tidak valid")
 
 
-def create_pmt_web_router(settings: TransferSettings) -> APIRouter:
+def create_pmt_web_router(
+    settings: TransferSettings,
+    *,
+    google_docs_fetcher: GoogleDocsFetcher = read_google_doc,
+) -> APIRouter:
     store = PmtStore(settings.pmt_db_path)
     store.initialize()
+    context_service = GoogleDocsContextService(store, settings, fetcher=google_docs_fetcher)
     router = APIRouter(prefix="/pmt", tags=["PMT Web"])
 
     @router.get("", response_class=HTMLResponse)
@@ -374,6 +381,11 @@ def create_pmt_web_router(settings: TransferSettings) -> APIRouter:
                 "task": task,
                 "events": store.task_events(task_ref),
                 "evidence": store.list_evidence(task_ref),
+                "context_documents": [
+                    store.get_task_context_document(task_ref, item["id"])
+                    for item in store.list_task_context_documents(task_ref)
+                ],
+                "google_docs_configured": settings.google_docs_service_account_file is not None,
                 "statuses": [task["status"]]
                 + [
                     status_name
@@ -392,6 +404,89 @@ def create_pmt_web_router(settings: TransferSettings) -> APIRouter:
                 "evidence_types": sorted(EVIDENCE_TYPES),
                 "csrf_token": request.session["csrf_token"],
             },
+        )
+
+    @router.post("/tasks/{task_ref}/context")
+    async def attach_context(
+        request: Request,
+        task_ref: str,
+        source_url: str = Form(...),
+        version: int = Form(...),
+        csrf_token: str = Form(...),
+    ) -> RedirectResponse:
+        _require_login(request)
+        _require_csrf(request, csrf_token)
+        try:
+            await context_service.attach(
+                task_ref,
+                source_url,
+                actor=_principal(request),
+                expected_version=version,
+            )
+        except KeyError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Task tidak ditemukan") from exc
+        except (PermissionError, ValueError) as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        return RedirectResponse(
+            f"/pmt/tasks/{task_ref}#external-context", status_code=status.HTTP_303_SEE_OTHER
+        )
+
+    @router.post("/tasks/{task_ref}/context/{context_ref}/refresh")
+    async def refresh_context(
+        request: Request,
+        task_ref: str,
+        context_ref: str,
+        version: int = Form(...),
+        context_version: int = Form(...),
+        csrf_token: str = Form(...),
+    ) -> RedirectResponse:
+        _require_login(request)
+        _require_csrf(request, csrf_token)
+        try:
+            await context_service.refresh(
+                task_ref,
+                context_ref,
+                actor=_principal(request),
+                expected_version=version,
+                expected_context_version=context_version,
+            )
+        except KeyError as exc:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, detail="Context tidak ditemukan"
+            ) from exc
+        except (PermissionError, ValueError) as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        return RedirectResponse(
+            f"/pmt/tasks/{task_ref}#external-context", status_code=status.HTTP_303_SEE_OTHER
+        )
+
+    @router.post("/tasks/{task_ref}/context/{context_ref}/remove")
+    def remove_context(
+        request: Request,
+        task_ref: str,
+        context_ref: str,
+        version: int = Form(...),
+        context_version: int = Form(...),
+        csrf_token: str = Form(...),
+    ) -> RedirectResponse:
+        _require_login(request)
+        _require_csrf(request, csrf_token)
+        try:
+            store.remove_task_context_document(
+                task_ref,
+                context_ref,
+                actor=_principal(request),
+                expected_version=version,
+                expected_context_version=context_version,
+            )
+        except KeyError as exc:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, detail="Context tidak ditemukan"
+            ) from exc
+        except (PermissionError, ValueError) as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        return RedirectResponse(
+            f"/pmt/tasks/{task_ref}#external-context", status_code=status.HTTP_303_SEE_OTHER
         )
 
     @router.post("/tasks/{task_ref}/edit")

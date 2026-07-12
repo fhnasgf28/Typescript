@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import json
+import fcntl
 import hashlib
+import json
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -58,6 +59,7 @@ AGENT_STATUS_TRANSITIONS = {
     "in_progress": {"in_progress", "blocked", "ready_for_review", "todo"},
     "blocked": {"in_progress", "todo"},
 }
+MAX_CONTEXT_DOCUMENTS_PER_TASK = 5
 
 
 class LeaseExpiredError(PermissionError):
@@ -108,6 +110,16 @@ class PmtStore:
 
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self.path.with_name(f"{self.path.name}.initialize.lock")
+        with lock_path.open("a+b") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                self._initialize_locked()
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    def _initialize_locked(self) -> None:
+        """Run schema setup while holding the cross-process initialization lock."""
         with self._connect() as db:
             db.executescript(
                 """
@@ -178,6 +190,45 @@ class PmtStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_task_evidence_task
                     ON task_evidence(task_id, created_at);
+                CREATE TABLE IF NOT EXISTS task_context_documents (
+                    id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL REFERENCES tasks(id),
+                    provider TEXT NOT NULL,
+                    source_url TEXT NOT NULL,
+                    external_id TEXT NOT NULL,
+                    selected_tab_id TEXT NOT NULL,
+                    title TEXT NOT NULL DEFAULT '',
+                    revision_id TEXT NOT NULL DEFAULT '',
+                    content_sha256 TEXT NOT NULL,
+                    context_version INTEGER NOT NULL DEFAULT 1,
+                    tab_count INTEGER NOT NULL,
+                    char_count INTEGER NOT NULL,
+                    fetched_at TEXT NOT NULL,
+                    last_checked_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(task_id,provider,external_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_task_context_documents_task
+                    ON task_context_documents(task_id,created_at);
+                CREATE TABLE IF NOT EXISTS task_context_tabs (
+                    context_document_id TEXT NOT NULL REFERENCES task_context_documents(id)
+                        ON DELETE CASCADE,
+                    tab_id TEXT NOT NULL,
+                    parent_tab_id TEXT,
+                    depth INTEGER NOT NULL,
+                    position INTEGER NOT NULL,
+                    order_index INTEGER NOT NULL,
+                    position_path TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    char_count INTEGER NOT NULL,
+                    snapshot TEXT NOT NULL,
+                    PRIMARY KEY(context_document_id,tab_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_task_context_tabs_order
+                    ON task_context_tabs(context_document_id,order_index);
                 CREATE TABLE IF NOT EXISTS agents (
                     agent_id TEXT PRIMARY KEY,
                     server_name TEXT NOT NULL,
@@ -726,6 +777,318 @@ class PmtStore:
             event["payload"] = json.loads(event["payload"])
             result.append(event)
         return result
+
+    @staticmethod
+    def _context_document(
+        row: sqlite3.Row, tabs: list[dict[str, Any]] | None = None
+    ) -> dict[str, Any]:
+        result = dict(row)
+        if tabs is not None:
+            result["tabs"] = tabs
+        return result
+
+    @staticmethod
+    def _context_tab(row: sqlite3.Row) -> dict[str, Any]:
+        snapshot = json.loads(row["snapshot"])
+        # The deterministic parser snapshot is authoritative; relational
+        # columns support hierarchy queries and migration inspection.
+        return snapshot
+
+    def _task_row(self, db: sqlite3.Connection, task_ref: str) -> sqlite3.Row:
+        row = db.execute(
+            "SELECT * FROM tasks WHERE id=? OR task_key=?", (task_ref, task_ref)
+        ).fetchone()
+        if row is None:
+            raise KeyError(task_ref)
+        return row
+
+    @staticmethod
+    def _require_task_version(row: sqlite3.Row, expected_version: int) -> None:
+        if row["version"] != expected_version:
+            raise PermissionError("task changed since it was loaded; refresh and retry")
+
+    def check_context_write_access(
+        self,
+        task_ref: str,
+        *,
+        expected_version: int,
+        expected_owner: str | None = None,
+        expected_run_id: str | None = None,
+        context_ref: str | None = None,
+    ) -> dict[str, Any]:
+        """Preflight a fetch without holding SQLite open across the network."""
+        with self._connect() as db:
+            task = self._task_row(db, task_ref)
+            self._require_active_owner(task, expected_owner, expected_run_id)
+            self._require_task_version(task, expected_version)
+            if context_ref is None:
+                return {"task": self._task(task), "context": None}
+            context = db.execute(
+                """SELECT * FROM task_context_documents
+                   WHERE task_id=? AND (id=? OR external_id=?)""",
+                (task["id"], context_ref, context_ref),
+            ).fetchone()
+            if context is None:
+                raise KeyError(context_ref)
+            return {"task": self._task(task), "context": self._context_document(context)}
+
+    def list_task_context_documents(self, task_ref: str) -> list[dict[str, Any]]:
+        with self._connect() as db:
+            task = self._task_row(db, task_ref)
+            rows = db.execute(
+                "SELECT * FROM task_context_documents WHERE task_id=? ORDER BY created_at,id",
+                (task["id"],),
+            ).fetchall()
+        return [self._context_document(row) for row in rows]
+
+    def get_task_context_document(self, task_ref: str, context_ref: str) -> dict[str, Any]:
+        with self._connect() as db:
+            task = self._task_row(db, task_ref)
+            row = db.execute(
+                """SELECT * FROM task_context_documents
+                   WHERE task_id=? AND (id=? OR external_id=?)""",
+                (task["id"], context_ref, context_ref),
+            ).fetchone()
+            if row is None:
+                raise KeyError(context_ref)
+            tab_rows = db.execute(
+                """SELECT * FROM task_context_tabs WHERE context_document_id=?
+                   ORDER BY order_index""",
+                (row["id"],),
+            ).fetchall()
+        return self._context_document(row, [self._context_tab(tab) for tab in tab_rows])
+
+    @staticmethod
+    def _validated_context_snapshot(snapshot: dict[str, Any]) -> tuple[list[dict[str, Any]], str]:
+        required = {
+            "document_id",
+            "title",
+            "revision_id",
+            "tabs",
+            "content_sha256",
+            "char_count",
+            "selected_tab_id",
+        }
+        if not isinstance(snapshot, dict) or not required <= set(snapshot):
+            raise ValueError("Google Docs snapshot is incomplete")
+        tabs = snapshot["tabs"]
+        digest = snapshot["content_sha256"]
+        if (
+            not isinstance(tabs, list)
+            or not 1 <= len(tabs) <= 100
+            or not isinstance(digest, str)
+            or len(digest) != 64
+        ):
+            raise ValueError("Google Docs snapshot is invalid")
+        try:
+            int(digest, 16)
+        except ValueError as exc:
+            raise ValueError("Google Docs snapshot hash is invalid") from exc
+        return tabs, digest
+
+    def save_task_context_snapshot(
+        self,
+        task_ref: str,
+        *,
+        source_url: str,
+        snapshot: dict[str, Any],
+        actor: str,
+        operation: str,
+        expected_version: int,
+        expected_context_version: int | None = None,
+        context_ref: str | None = None,
+        expected_owner: str | None = None,
+        expected_run_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically attach/refresh a normalized snapshot and its tabs."""
+        if operation not in {"attach", "refresh"}:
+            raise ValueError("invalid context operation")
+        tabs, digest = self._validated_context_snapshot(snapshot)
+        now = iso()
+        with self._transaction() as db:
+            task = self._task_row(db, task_ref)
+            self._require_active_owner(task, expected_owner, expected_run_id)
+            self._require_task_version(task, expected_version)
+            if operation == "refresh":
+                current = db.execute(
+                    """SELECT * FROM task_context_documents
+                       WHERE task_id=? AND (id=? OR external_id=?)""",
+                    (task["id"], context_ref, context_ref),
+                ).fetchone()
+                if current is None:
+                    raise KeyError(context_ref or "")
+            else:
+                current = db.execute(
+                    """SELECT * FROM task_context_documents
+                       WHERE task_id=? AND provider='google_docs' AND external_id=?""",
+                    (task["id"], snapshot["document_id"]),
+                ).fetchone()
+                if current is None:
+                    count = db.execute(
+                        "SELECT COUNT(*) AS count FROM task_context_documents WHERE task_id=?",
+                        (task["id"],),
+                    ).fetchone()["count"]
+                    if count >= MAX_CONTEXT_DOCUMENTS_PER_TASK:
+                        raise ValueError("task exceeds the 5 external context document limit")
+
+            if current is not None:
+                compatible_identity = (
+                    current["provider"] == "google_docs"
+                    and current["external_id"] == snapshot["document_id"]
+                    and current["source_url"] == source_url
+                    and current["selected_tab_id"] == snapshot["selected_tab_id"]
+                )
+                unchanged = compatible_identity and current["content_sha256"] == digest
+                if unchanged:
+                    db.execute(
+                        """UPDATE task_context_documents SET last_checked_at=?,updated_at=?
+                           WHERE id=?""",
+                        (now, now, current["id"]),
+                    )
+                    row = db.execute(
+                        "SELECT * FROM task_context_documents WHERE id=?", (current["id"],)
+                    ).fetchone()
+                    result = self._context_document(row)
+                    result["changed"] = False
+                    return result
+                if operation == "attach" and expected_context_version is None:
+                    raise PermissionError(
+                        "Google Docs context is already attached; refresh the existing snapshot"
+                    )
+                if (
+                    expected_context_version is None
+                    or current["context_version"] != expected_context_version
+                ):
+                    raise PermissionError("context changed since it was loaded; refresh and retry")
+                context_id = current["id"]
+                context_version = current["context_version"] + 1
+                created_at = current["created_at"]
+                db.execute(
+                    "DELETE FROM task_context_tabs WHERE context_document_id=?", (context_id,)
+                )
+                db.execute("DELETE FROM task_context_documents WHERE id=?", (context_id,))
+            else:
+                if operation == "refresh":
+                    raise KeyError(context_ref or "")
+                context_id = f"context_{uuid.uuid4().hex}"
+                context_version = 1
+                created_at = now
+
+            db.execute(
+                """INSERT INTO task_context_documents(
+                    id,task_id,provider,source_url,external_id,selected_tab_id,title,revision_id,
+                    content_sha256,context_version,tab_count,char_count,fetched_at,last_checked_at,
+                    created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    context_id,
+                    task["id"],
+                    "google_docs",
+                    source_url,
+                    snapshot["document_id"],
+                    snapshot["selected_tab_id"],
+                    snapshot["title"],
+                    snapshot["revision_id"],
+                    digest,
+                    context_version,
+                    len(tabs),
+                    snapshot["char_count"],
+                    now,
+                    now,
+                    created_at,
+                    now,
+                ),
+            )
+            for order_index, tab in enumerate(tabs):
+                encoded = json.dumps(
+                    tab, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+                )
+                db.execute(
+                    """INSERT INTO task_context_tabs(
+                        context_document_id,tab_id,parent_tab_id,depth,position,order_index,
+                        position_path,path,title,text,char_count,snapshot
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        context_id,
+                        tab["tab_id"],
+                        tab["parent_tab_id"],
+                        tab["depth"],
+                        tab["position"],
+                        order_index,
+                        json.dumps(tab["position_path"]),
+                        tab["path"],
+                        tab["title"],
+                        tab["text"],
+                        tab["char_count"],
+                        encoded,
+                    ),
+                )
+            event_type = (
+                "task.context_attached" if context_version == 1 else "task.context_refreshed"
+            )
+            self._event(
+                db,
+                task["id"],
+                event_type,
+                actor,
+                {
+                    "context_id": context_id,
+                    "provider": "google_docs",
+                    "external_id": snapshot["document_id"],
+                    "context_version": context_version,
+                    "content_sha256": digest,
+                    "tab_count": len(tabs),
+                    "char_count": snapshot["char_count"],
+                },
+            )
+            row = db.execute(
+                "SELECT * FROM task_context_documents WHERE id=?", (context_id,)
+            ).fetchone()
+        result = self._context_document(row)
+        result["changed"] = True
+        return result
+
+    def remove_task_context_document(
+        self,
+        task_ref: str,
+        context_ref: str,
+        *,
+        actor: str,
+        expected_version: int,
+        expected_context_version: int,
+        expected_owner: str | None = None,
+        expected_run_id: str | None = None,
+    ) -> dict[str, Any]:
+        with self._transaction() as db:
+            task = self._task_row(db, task_ref)
+            self._require_active_owner(task, expected_owner, expected_run_id)
+            self._require_task_version(task, expected_version)
+            row = db.execute(
+                """SELECT * FROM task_context_documents
+                   WHERE task_id=? AND (id=? OR external_id=?)""",
+                (task["id"], context_ref, context_ref),
+            ).fetchone()
+            if row is None:
+                raise KeyError(context_ref)
+            if row["context_version"] != expected_context_version:
+                raise PermissionError("context changed since it was loaded; refresh and retry")
+            metadata = self._context_document(row)
+            db.execute("DELETE FROM task_context_tabs WHERE context_document_id=?", (row["id"],))
+            db.execute("DELETE FROM task_context_documents WHERE id=?", (row["id"],))
+            self._event(
+                db,
+                task["id"],
+                "task.context_removed",
+                actor,
+                {
+                    "context_id": row["id"],
+                    "provider": row["provider"],
+                    "external_id": row["external_id"],
+                    "context_version": row["context_version"],
+                    "content_sha256": row["content_sha256"],
+                },
+            )
+        return metadata
 
     def update_task(
         self,
