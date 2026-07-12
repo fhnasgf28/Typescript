@@ -22,6 +22,26 @@ from mcp_transfer_node.pmt_store import (
 )
 
 TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
+MAX_WEB_CONTEXT_CHARS_PER_DOCUMENT = 20_000
+MAX_WEB_CONTEXT_CHARS_PER_TAB = 5_000
+
+
+def _bounded_web_context(document: dict[str, object]) -> dict[str, object]:
+    """Bound untrusted document text rendered into the server-side task page."""
+    remaining = MAX_WEB_CONTEXT_CHARS_PER_DOCUMENT
+    bounded_tabs: list[dict[str, object]] = []
+    for raw_tab in document.get("tabs", []):
+        tab = dict(raw_tab)
+        text = str(tab.pop("text", ""))
+        allowance = min(MAX_WEB_CONTEXT_CHARS_PER_TAB, remaining)
+        display_text = text[:allowance]
+        remaining -= len(display_text)
+        tab.pop("paragraphs", None)
+        tab.pop("tables", None)
+        tab["display_text"] = display_text
+        tab["display_truncated"] = len(display_text) < len(text)
+        bounded_tabs.append(tab)
+    return {**document, "tabs": bounded_tabs}
 
 
 def _require_login(request: Request) -> None:
@@ -382,7 +402,7 @@ def create_pmt_web_router(
                 "events": store.task_events(task_ref),
                 "evidence": store.list_evidence(task_ref),
                 "context_documents": [
-                    store.get_task_context_document(task_ref, item["id"])
+                    _bounded_web_context(store.get_task_context_document(task_ref, item["id"]))
                     for item in store.list_task_context_documents(task_ref)
                 ],
                 "google_docs_configured": settings.google_docs_service_account_file is not None,

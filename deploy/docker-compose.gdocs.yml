@@ -1,0 +1,10 @@
+services:
+  pmt:
+    environment:
+      MCP_PMT_GOOGLE_DOCS_SERVICE_ACCOUNT_FILE: /run/pmt-secrets/google-service-account.json
+      MCP_PMT_GOOGLE_DOCS_TIMEOUT_SECONDS: ${MCP_PMT_GOOGLE_DOCS_TIMEOUT_SECONDS:-30}
+    volumes:
+      - type: bind
+        source: ${MCP_PMT_GOOGLE_DOCS_CREDENTIAL_HOST_FILE:?set an owner-only host credential file}
+        target: /run/pmt-secrets/google-service-account.json
+        read_only: true

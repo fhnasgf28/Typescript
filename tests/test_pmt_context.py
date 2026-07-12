@@ -90,7 +90,7 @@ def test_context_schema_lifecycle_idempotency_and_no_task_version_bump(tmp_path:
     )
     assert unchanged["changed"] is False
     assert unchanged["context_version"] == 1
-    assert unchanged["revision_id"] == "r1"
+    assert unchanged["revision_id"] == "r2"
 
     changed = store.save_task_context_snapshot(
         task["task_key"],
@@ -143,6 +143,57 @@ def test_context_schema_lifecycle_idempotency_and_no_task_version_bump(tmp_path:
     assert all(
         "hello" not in str(payload) and "changed" not in str(payload) for payload in event_payloads
     )
+
+
+@pytest.mark.asyncio
+async def test_attach_preflight_avoids_duplicate_and_over_limit_fetches(tmp_path: Path):
+    store, task = _store(tmp_path)
+    credential = tmp_path / "service-account.json"
+    credential.write_text("{}", encoding="utf-8")
+    os.chmod(credential, 0o600)
+    calls = 0
+
+    async def fetcher(source_url, _credential, **_kwargs):
+        nonlocal calls
+        calls += 1
+        document_id = source_url.rsplit("/", 1)[-1]
+        payload = _payload()
+        payload["documentId"] = document_id
+        return parse_google_doc_payload(payload)
+
+    service = GoogleDocsContextService(store, _settings(tmp_path, credential), fetcher=fetcher)
+    first = await service.attach(
+        task["task_key"],
+        "https://docs.google.com/document/d/doc0",
+        actor="Farhan",
+        expected_version=task["version"],
+    )
+    replay = await service.attach(
+        task["task_key"],
+        "https://docs.google.com/document/d/doc0",
+        actor="Farhan",
+        expected_version=task["version"],
+    )
+    assert replay["id"] == first["id"]
+    assert replay["changed"] is False
+    assert calls == 1
+
+    for index in range(1, 5):
+        await service.attach(
+            task["task_key"],
+            f"https://docs.google.com/document/d/doc{index}",
+            actor="Farhan",
+            expected_version=task["version"],
+        )
+    assert calls == 5
+    with pytest.raises(ValueError, match="5 external context"):
+        await service.attach(
+            task["task_key"],
+            "https://docs.google.com/document/d/doc5",
+            actor="Farhan",
+            expected_version=task["version"],
+        )
+    assert calls == 5
 
 
 @pytest.mark.asyncio

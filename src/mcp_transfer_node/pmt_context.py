@@ -68,13 +68,17 @@ class GoogleDocsContextService:
         expected_owner: str | None = None,
         expected_run_id: str | None = None,
     ) -> dict[str, Any]:
-        parse_google_doc_url(source_url)
-        self.store.check_context_write_access(
+        link = parse_google_doc_url(source_url)
+        preflight = self.store.check_context_write_access(
             task_ref,
             expected_version=expected_version,
             expected_owner=expected_owner,
             expected_run_id=expected_run_id,
+            external_id=link.document_id,
+            source_url=source_url,
         )
+        if preflight["context"] is not None:
+            return {**preflight["context"], "changed": False}
         snapshot = await self._fetch(source_url)
         return self.store.save_task_context_snapshot(
             task_ref,

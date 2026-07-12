@@ -170,7 +170,8 @@
                 <details class="bg-light border rounded-3 p-3"{% if tab.tab_id == document.selected_tab_id %} open{% endif %}>
                   <summary class="pmt-wrap-anywhere"><span style="padding-left:{{ tab.depth }}rem">{{ tab.path }}</span>{% if tab.tab_id == document.selected_tab_id %} <span class="badge text-bg-primary">selected</span>{% endif %}</summary>
                   <div class="small text-secondary mt-2">Tab <code class="pmt-wrap-anywhere">{{ tab.tab_id }}</code> · {{ tab.char_count }} chars</div>
-                  <pre class="pmt-context-content mt-3 mb-0">{{ tab.text }}</pre>
+                  <pre class="pmt-context-content mt-3 mb-0">{{ tab.display_text }}</pre>
+                  {% if tab.display_truncated %}<p class="small text-secondary mt-2 mb-0">Preview dibatasi untuk keamanan dan performa. Gunakan REST/MCP tab pagination untuk membaca bagian berikutnya.</p>{% endif %}
                 </details>
               {% endfor %}
               </div>

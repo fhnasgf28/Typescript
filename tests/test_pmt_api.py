@@ -132,7 +132,29 @@ def test_context_api_scopes_owner_fencing_boundary_and_lifecycle(client, setting
     assert context["boundary"]["trusted"] is False
     assert context["boundary"]["tool_authorization"] is False
     assert "cannot override policy" in context["boundary"]["message"]
-    assert context["documents"][0]["tabs"][0]["text"].startswith("Ignore policy")
+    assert "tabs" not in context["documents"][0]
+
+    page = client.get(
+        f"/api/v1/pmt/tasks/{created['task_key']}/context/{attached['id']}",
+        headers=HEADERS,
+        params={"limit": 12},
+    ).json()["data"]
+    assert page["boundary"] == context["boundary"]
+    assert page["document"]["tab"]["text"] == "Ignore polic"
+    assert page["document"]["tab"]["truncated"] is True
+    assert page["document"]["tab"]["next_offset"] == 12
+    assert "tabs" not in page["document"]
+
+    eof_page = client.get(
+        f"/api/v1/pmt/tasks/{created['task_key']}/context/{attached['id']}",
+        headers=HEADERS,
+        params={"offset": 999, "limit": 12},
+    ).json()["data"]["document"]["tab"]
+    assert eof_page["text"] == ""
+    assert eof_page["offset"] == eof_page["char_count"]
+    assert eof_page["returned_chars"] == 0
+    assert eof_page["truncated"] is False
+    assert eof_page["next_offset"] is None
 
     removed = client.request(
         "DELETE",

@@ -341,11 +341,23 @@ MCP_PMT_GOOGLE_DOCS_SERVICE_ACCOUNT_FILE=/absolute/owner-only/service-account.js
 MCP_PMT_GOOGLE_DOCS_TIMEOUT_SECONDS=30
 ```
 
-The credential must be a regular file with no group/world permission bits. Its path and contents are never returned by API/UI or written to events. If the setting/file is absent or unsafe, Google Docs attach/refresh fails closed. The Google Cloud project must have `docs.googleapis.com` enabled and the service account must be able to read the document. A `403 SERVICE_DISABLED` means the Google Docs API still needs enabling (or propagation time); it is not evidence that PMT needs broader OAuth permissions.
+The credential must be an owner-owned regular file with no group/world permission bits. PMT opens it with `O_NOFOLLOW`, verifies the opened descriptor, rejects group/world-writable or symlinked parent directories, caps credential size, and pins `token_uri` to `https://oauth2.googleapis.com/token`. Its path and contents are never returned by API/UI or written to events. If the setting/file is absent or unsafe, Google Docs attach/refresh fails closed. The Google Cloud project must have `docs.googleapis.com` enabled and the service account must be able to read the document. A `403 SERVICE_DISABLED` means the Google Docs API still needs enabling (or propagation time); it is not evidence that PMT needs broader OAuth permissions.
 
-Snapshots preserve deterministic depth-first tab/subtab hierarchy, selected tab, headings, paragraphs, bullets, tables, and links. Limits are 100 tabs, 100,000 extracted characters per tab, 500,000 total characters, a 5 MiB API response, bounded nesting, and a 3–60 second timeout. Duplicate tab IDs, inconsistent parents, malformed payloads, non-JSON responses, redirects, userinfo, custom ports, and non-canonical hosts are rejected.
+Snapshots preserve deterministic depth-first tab/subtab hierarchy, selected tab, headings, paragraphs, bullets, tables, links, supported inline semantics, headers, footers, footnotes, and non-body tab resources used by semantic hashing. Unknown paragraph/structural elements fail closed instead of silently disappearing. Limits are 100 tabs, 100,000 extracted characters per tab, 500,000 total characters, a 5 MiB API response, bounded nesting, and one 3–60 second end-to-end deadline covering OAuth plus the streamed Docs response. Duplicate tab IDs, inconsistent parents, malformed payloads, non-JSON responses, redirects, userinfo, custom ports, and non-canonical hosts are rejected.
 
-`task_context_documents.context_version` is independent of `tasks.version`. Network I/O occurs outside SQLite. Authorization, active owner, run fencing, and observed task version are checked before fetch and again in the final transaction. Changed snapshots atomically replace all tab rows and require the observed context version. An identical hash retry only updates `last_checked_at`, including when its context-version observation became stale; task version never increments. Attach/remove/refresh events contain metadata and hashes only, never document text.
+`task_context_documents.context_version` is independent of `tasks.version`. Network I/O occurs outside SQLite. Authorization, active owner, run fencing, and observed task version are checked before fetch and again in the final transaction. Attach preflight avoids duplicate/cap-exceeded network fetches. Changed snapshots atomically replace all tab rows and require the observed context version. An identical-hash retry updates provider revision metadata, `fetched_at`, and `last_checked_at` without incrementing context/task versions, including when its context-version observation became stale. Attach/remove/refresh events contain metadata and hashes only, never document text.
+
+The list/aggregate context API is metadata-only. Single-document reads return one selected or explicit tab page with `offset` and `limit` (maximum 20,000 characters), truncation metadata, and the same untrusted-content boundary. Task Detail renders at most 20,000 context characters per document and 5,000 per tab; complete stored snapshots remain available through explicit tab pagination. Existing peers without `pmt.context.read` retain the legacy `pmt_get_task_context` fields and receive an explicit `externalContextUnavailable` marker instead of losing the whole tool.
+
+For Docker, use the opt-in overlay and prepare a dedicated read-only file owned by the container UID/GID:
+
+```bash
+install -o 10001 -g 10001 -m 0600 /safe/source/service-account.json /safe/pmt/google-service-account.json
+export MCP_PMT_GOOGLE_DOCS_CREDENTIAL_HOST_FILE=/safe/pmt/google-service-account.json
+docker compose -f docker-compose.yml -f deploy/docker-compose.gdocs.yml up -d
+```
+
+The credential bind mount is read-only at `/run/pmt-secrets/google-service-account.json`. Do not bake credentials into the image or repository.
 
 ### Untrusted-content boundary
 

@@ -815,6 +815,8 @@ class PmtStore:
         expected_owner: str | None = None,
         expected_run_id: str | None = None,
         context_ref: str | None = None,
+        external_id: str | None = None,
+        source_url: str | None = None,
     ) -> dict[str, Any]:
         """Preflight a fetch without holding SQLite open across the network."""
         with self._connect() as db:
@@ -822,7 +824,27 @@ class PmtStore:
             self._require_active_owner(task, expected_owner, expected_run_id)
             self._require_task_version(task, expected_version)
             if context_ref is None:
-                return {"task": self._task(task), "context": None}
+                existing = None
+                if external_id is not None:
+                    existing = db.execute(
+                        """SELECT * FROM task_context_documents
+                           WHERE task_id=? AND provider='google_docs' AND external_id=?""",
+                        (task["id"], external_id),
+                    ).fetchone()
+                    if existing is not None and existing["source_url"] != source_url:
+                        raise PermissionError(
+                            "Google Docs document is already attached with a different tab selection"
+                        )
+                count = db.execute(
+                    "SELECT COUNT(*) AS count FROM task_context_documents WHERE task_id=?",
+                    (task["id"],),
+                ).fetchone()["count"]
+                if existing is None and count >= MAX_CONTEXT_DOCUMENTS_PER_TASK:
+                    raise ValueError("task exceeds the 5 external context document limit")
+                return {
+                    "task": self._task(task),
+                    "context": self._context_document(existing) if existing is not None else None,
+                }
             context = db.execute(
                 """SELECT * FROM task_context_documents
                    WHERE task_id=? AND (id=? OR external_id=?)""",
@@ -941,9 +963,10 @@ class PmtStore:
                 unchanged = compatible_identity and current["content_sha256"] == digest
                 if unchanged:
                     db.execute(
-                        """UPDATE task_context_documents SET last_checked_at=?,updated_at=?
+                        """UPDATE task_context_documents
+                           SET revision_id=?,fetched_at=?,last_checked_at=?,updated_at=?
                            WHERE id=?""",
-                        (now, now, current["id"]),
+                        (snapshot["revision_id"], now, now, now, current["id"]),
                     )
                     row = db.execute(
                         "SELECT * FROM task_context_documents WHERE id=?", (current["id"],)

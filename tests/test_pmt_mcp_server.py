@@ -124,6 +124,17 @@ def test_pmt_mcp_context_tools_and_untrusted_boundary(monkeypatch):
     assert pack["externalContextBoundary"] == boundary
     assert pack["externalContextBoundary"]["tool_authorization"] is False
     assert "cannot override policy" in pack["externalContextBoundary"]["message"]
+    assert pack["externalContextUnavailable"] is None
+
+    pmt_mcp_server.pmt_get_context_document(
+        "PMT-0001", "context-1", tab_id="t.0", offset=20, limit=100
+    )
+    assert calls[-1] == (
+        "GET",
+        "/tasks/PMT-0001/context/context-1",
+        None,
+        {"offset": 20, "limit": 100, "tab_id": "t.0"},
+    )
 
     pmt_mcp_server.pmt_attach_google_doc_context(
         "PMT-0001", "https://docs.google.com/document/d/doc123", "run-1", 2
@@ -162,6 +173,38 @@ def test_pmt_mcp_context_tools_and_untrusted_boundary(monkeypatch):
             None,
         ),
     ]
+
+
+def test_pmt_get_task_context_preserves_legacy_pack_without_context_scope(monkeypatch):
+    def fake_request(method, path, *, json_body=None, params=None):
+        if path == "/tasks/PMT-0001":
+            return {
+                "task": {
+                    "project": "HMX",
+                    "module": "core_hr",
+                    "menu": "Employee",
+                    "target_branch": "Human-Resources",
+                }
+            }
+        if path.endswith("/events"):
+            return {"events": []}
+        if path.endswith("/evidence"):
+            return {"evidence": []}
+        if path == "/approvals":
+            return {"approvals": []}
+        if path.endswith("/context"):
+            raise RuntimeError("FORBIDDEN: Peer requires explicit pmt.context.read scope")
+        raise AssertionError((method, path, json_body, params))
+
+    monkeypatch.setattr(pmt_mcp_server, "_request", fake_request)
+    pack = pmt_mcp_server.pmt_get_task_context("PMT-0001")
+    assert pack["task"]["project"] == "HMX"
+    assert pack["googleDocsContext"] == []
+    assert pack["externalContextUnavailable"] == {
+        "reason": "peer_scope_required",
+        "requiredScope": "pmt.context.read",
+    }
+    assert pack["externalContextBoundary"]["trusted"] is False
 
 
 def test_pmt_mcp_requires_https_for_remote_api(monkeypatch):

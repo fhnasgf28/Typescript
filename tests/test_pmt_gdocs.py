@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -10,7 +13,9 @@ import pytest
 
 from mcp_transfer_node.pmt_gdocs import (
     DOCS_API_SCOPE,
+    GOOGLE_OAUTH_TOKEN_URI,
     GoogleDocsError,
+    _secure_service_account_info,
     parse_google_doc_payload,
     parse_google_doc_url,
     read_google_doc,
@@ -184,6 +189,70 @@ def test_parse_recursive_tabs_paragraphs_bullets_headings_tables_and_links():
         allow_nan=False,
     )
     assert snapshot["content_sha256"] == hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def test_parser_captures_inline_semantics_footnotes_and_tab_resources():
+    base = document_payload(
+        {
+            "tabProperties": {"tabId": "root", "title": "Root"},
+            "documentTab": {
+                "body": {
+                    "content": [
+                        {
+                            "paragraph": {
+                                "elements": [
+                                    {"person": {"personProperties": {"name": "Reviewer"}}},
+                                    {
+                                        "footnoteReference": {
+                                            "footnoteId": "fn-1",
+                                            "footnoteNumber": "1",
+                                        }
+                                    },
+                                    {"horizontalRule": {}},
+                                ],
+                                "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                            }
+                        }
+                    ]
+                },
+                "footnotes": {
+                    "fn-1": {"content": [paragraph("Footnote body")]},
+                },
+                "inlineObjects": {"obj-1": {"inlineObjectProperties": {"description": "v1"}}},
+            },
+            "childTabs": [],
+        }
+    )
+    changed = json.loads(json.dumps(base))
+    changed["tabs"][0]["documentTab"]["inlineObjects"]["obj-1"]["inlineObjectProperties"][
+        "description"
+    ] = "v2"
+
+    snapshot = parse_google_doc_payload(base)
+    assert "[person Reviewer]" in snapshot["tabs"][0]["text"]
+    assert "[footnote 1]" in snapshot["tabs"][0]["text"]
+    assert "Footnote body" in snapshot["tabs"][0]["text"]
+    assert snapshot["tabs"][0]["resources"]["inlineObjects"]
+    assert parse_google_doc_payload(changed)["content_sha256"] != snapshot["content_sha256"]
+
+
+def test_parser_fails_closed_on_unknown_paragraph_element():
+    payload = document_payload(
+        tab(
+            "root",
+            "Root",
+            [
+                {
+                    "paragraph": {
+                        "elements": [{"futureUnsupportedElement": {"value": "x"}}],
+                        "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                    }
+                }
+            ],
+        )
+    )
+    with pytest.raises(GoogleDocsError, match="unsupported paragraph element"):
+        parse_google_doc_payload(payload)
 
 
 def test_hash_detects_semantic_structure_but_ignores_provider_revision():
@@ -392,6 +461,94 @@ async def test_reader_rejects_invalid_timeout_before_auth(tmp_path: Path, timeou
             tmp_path / "credentials.json",
             access_token_provider=lambda _path, _scopes: "token",
             timeout_seconds=timeout,
+        )
+
+
+def test_secure_credential_reader_pins_oauth_uri_and_rejects_unsafe_parent(tmp_path: Path):
+    unsafe = tmp_path / "service-account.json"
+    unsafe.write_text("{}", encoding="utf-8")
+    os.chmod(unsafe, 0o600)
+    with pytest.raises(GoogleDocsError, match="unsafe parent"):
+        _secure_service_account_info(unsafe)
+
+    with tempfile.TemporaryDirectory(prefix="pmt-gdocs-", dir=Path.home()) as directory:
+        credential = Path(directory) / "service-account.json"
+        credential.write_text(
+            json.dumps({"type": "service_account", "token_uri": "https://evil.test/token"}),
+            encoding="utf-8",
+        )
+        os.chmod(credential, 0o600)
+        with pytest.raises(GoogleDocsError, match="OAuth endpoint"):
+            _secure_service_account_info(credential)
+        credential.write_text(
+            json.dumps({"type": "service_account", "token_uri": GOOGLE_OAUTH_TOKEN_URI}),
+            encoding="utf-8",
+        )
+        assert _secure_service_account_info(credential)["token_uri"] == GOOGLE_OAUTH_TOKEN_URI
+
+
+@pytest.mark.asyncio
+async def test_reader_total_deadline_bounds_slow_auth(tmp_path: Path):
+    async def stalled_auth(_path: Path, _scopes: tuple[str, ...]) -> str:
+        await asyncio.sleep(10)
+        return "token"
+
+    with pytest.raises(GoogleDocsError, match="allowed time"):
+        await read_google_doc(
+            "https://docs.google.com/document/d/abc",
+            tmp_path / "credentials.json",
+            access_token_provider=stalled_auth,
+            timeout_seconds=3,
+        )
+
+
+@pytest.mark.asyncio
+async def test_reader_total_deadline_bounds_slow_stream(tmp_path: Path):
+    class SlowStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            while True:
+                await asyncio.sleep(1)
+                yield b" "
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            stream=SlowStream(),
+            request=request,
+        )
+
+    with pytest.raises(GoogleDocsError, match="allowed time"):
+        await read_google_doc(
+            "https://docs.google.com/document/d/abc",
+            tmp_path / "credentials.json",
+            transport=httpx.MockTransport(handler),
+            access_token_provider=lambda _path, _scopes: "token",
+            timeout_seconds=3,
+        )
+
+
+@pytest.mark.asyncio
+async def test_reader_wraps_unexpected_stream_failures(tmp_path: Path):
+    class BrokenStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            raise RuntimeError("broken stream")
+            yield b""  # pragma: no cover - keeps this an async iterator
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            stream=BrokenStream(),
+            request=request,
+        )
+
+    with pytest.raises(GoogleDocsError, match="API request failed"):
+        await read_google_doc(
+            "https://docs.google.com/document/d/abc",
+            tmp_path / "credentials.json",
+            transport=httpx.MockTransport(handler),
+            access_token_provider=lambda _path, _scopes: "token",
         )
 
 

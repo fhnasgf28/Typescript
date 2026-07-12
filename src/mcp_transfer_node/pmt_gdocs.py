@@ -178,7 +178,71 @@ def _paragraph(paragraph: Any, where: str) -> tuple[str, dict[str, Any]]:
                 allow_empty=False,
             )
             rendered.append(f"[inline object {object_id}]")
-        # Other documented structural inline element types contain no plain text.
+        elif "footnoteReference" in element:
+            reference = _object(
+                element["footnoteReference"],
+                f"{where}.elements[{index}].footnoteReference",
+            )
+            footnote_id = _string(
+                reference.get("footnoteId"),
+                f"{where}.elements[{index}].footnoteReference.footnoteId",
+                allow_empty=False,
+            )
+            number = _string(
+                reference.get("footnoteNumber", ""),
+                f"{where}.elements[{index}].footnoteReference.footnoteNumber",
+            )
+            rendered.append(f"[footnote {number or footnote_id}]")
+        elif "person" in element:
+            person = _object(element["person"], f"{where}.elements[{index}].person")
+            properties = _object(
+                person.get("personProperties", {}),
+                f"{where}.elements[{index}].person.personProperties",
+            )
+            name = _string(
+                properties.get("name", ""),
+                f"{where}.elements[{index}].person.personProperties.name",
+            )
+            email = _string(
+                properties.get("email", ""),
+                f"{where}.elements[{index}].person.personProperties.email",
+            )
+            rendered.append(f"[person {name or email}]")
+        elif "autoText" in element:
+            auto_text = _object(element["autoText"], f"{where}.elements[{index}].autoText")
+            auto_type = _string(
+                auto_text.get("type"),
+                f"{where}.elements[{index}].autoText.type",
+                allow_empty=False,
+            )
+            rendered.append(f"[auto text {auto_type}]")
+        elif "horizontalRule" in element:
+            _object(element["horizontalRule"], f"{where}.elements[{index}].horizontalRule")
+            rendered.append("\n---\n")
+        elif "pageBreak" in element:
+            _object(element["pageBreak"], f"{where}.elements[{index}].pageBreak")
+            rendered.append("\n[page break]\n")
+        elif "columnBreak" in element:
+            _object(element["columnBreak"], f"{where}.elements[{index}].columnBreak")
+            rendered.append("\n[column break]\n")
+        elif "equation" in element:
+            equation = _object(element["equation"], f"{where}.elements[{index}].equation")
+            rendered.append(
+                "[equation "
+                + json.dumps(
+                    equation,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
+                + "]"
+            )
+        else:
+            raise GoogleDocsError(
+                f"Malformed Google Docs payload: unsupported paragraph element at "
+                f"{where}.elements[{index}]"
+            )
 
     raw_text = "".join(rendered).rstrip("\n")
     style = _object(value.get("paragraphStyle", {}), f"{where}.paragraphStyle")
@@ -275,6 +339,39 @@ def _structural_content(
     return "\n".join(blocks).strip("\n"), paragraphs, tables
 
 
+def _document_tab_text(
+    document_tab: Mapping[str, Any], where: str
+) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    """Normalize body plus headers, footers and footnotes in stable key order."""
+    body = _object(document_tab.get("body"), f"{where}.body")
+    text, paragraphs, tables = _structural_content(body.get("content", []), f"{where}.body.content")
+    blocks = [text] if text else []
+    labels = {"headers": "Header", "footers": "Footer", "footnotes": "Footnote"}
+    for collection_name, label in labels.items():
+        collection = _object(document_tab.get(collection_name, {}), f"{where}.{collection_name}")
+        for segment_id in sorted(collection):
+            segment = _object(collection[segment_id], f"{where}.{collection_name}[{segment_id!r}]")
+            segment_text, segment_paragraphs, segment_tables = _structural_content(
+                segment.get("content", []),
+                f"{where}.{collection_name}[{segment_id!r}].content",
+                nesting_depth=1,
+            )
+            blocks.append(f"## {label} {segment_id}\n{segment_text}".rstrip())
+            paragraphs.extend(segment_paragraphs)
+            tables.extend(segment_tables)
+
+    resources = {
+        key: value
+        for key, value in document_tab.items()
+        if key not in {"body", "headers", "footers", "footnotes"}
+    }
+    try:
+        json.dumps(resources, ensure_ascii=False, sort_keys=True, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise GoogleDocsError("Malformed Google Docs payload: tab resources are invalid") from exc
+    return "\n\n".join(blocks), paragraphs, tables, resources
+
+
 def parse_google_doc_payload(
     payload: Any,
     *,
@@ -337,8 +434,7 @@ def parse_google_doc_payload(
                 )
 
         document_tab = _object(tab.get("documentTab"), "tab.documentTab")
-        body = _object(document_tab.get("body"), "tab.documentTab.body")
-        text, paragraphs, tables = _structural_content(body.get("content", []), "tab.body.content")
+        text, paragraphs, tables, resources = _document_tab_text(document_tab, "tab.documentTab")
         char_count = len(text)
         if char_count > MAX_TAB_CHARS:
             raise GoogleDocsError(f"Google Docs tab {tab_id!r} exceeds the 100000 character limit")
@@ -363,6 +459,7 @@ def parse_google_doc_payload(
                 "char_count": char_count,
                 "paragraphs": paragraphs,
                 "tables": tables,
+                "resources": resources,
             }
         )
         child_tabs = _list(tab.get("childTabs", []), "tab.childTabs")
@@ -526,13 +623,18 @@ async def read_google_doc(
     timeout = max(3.0, min(float(timeout_seconds), 60.0))
     try:
         async with asyncio.timeout(timeout):
-            if access_token_provider is None:
-                token_result = _default_access_token_provider(
-                    credential_path, (DOCS_API_SCOPE,), timeout
-                )
-            else:
-                token_result = access_token_provider(credential_path, (DOCS_API_SCOPE,))
-            token = await token_result if inspect.isawaitable(token_result) else token_result
+            try:
+                if access_token_provider is None:
+                    token_result = _default_access_token_provider(
+                        credential_path, (DOCS_API_SCOPE,), timeout
+                    )
+                else:
+                    token_result = access_token_provider(credential_path, (DOCS_API_SCOPE,))
+                token = await token_result if inspect.isawaitable(token_result) else token_result
+            except GoogleDocsError:
+                raise
+            except Exception as exc:
+                raise GoogleDocsError("Google service-account authentication failed") from exc
             if not isinstance(token, str) or not token or any(char.isspace() for char in token):
                 raise GoogleDocsError(
                     "Google service-account authentication returned an invalid token"
@@ -567,7 +669,8 @@ async def read_google_doc(
                             error_payload = json.loads(bytes(body))
                             details = error_payload.get("error", {}).get("details", [])
                             service_disabled = any(
-                                isinstance(item, Mapping) and item.get("reason") == "SERVICE_DISABLED"
+                                isinstance(item, Mapping)
+                                and item.get("reason") == "SERVICE_DISABLED"
                                 for item in details
                             )
                         except (AttributeError, json.JSONDecodeError, UnicodeDecodeError):
@@ -591,15 +694,13 @@ async def read_google_doc(
         ) from exc
     except GoogleDocsError:
         raise
-    except Exception as exc:
-        if not isinstance(exc, httpx.HTTPError):
-            raise GoogleDocsError("Google service-account authentication failed") from exc
-        raise
     except (httpx.TimeoutException, httpx.NetworkError) as exc:
         raise GoogleDocsError(
             "Google Docs API could not be reached within the allowed time"
         ) from exc
     except httpx.HTTPError as exc:
+        raise GoogleDocsError("Google Docs API request failed") from exc
+    except Exception as exc:
         raise GoogleDocsError("Google Docs API request failed") from exc
 
     try:
