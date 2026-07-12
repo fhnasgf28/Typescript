@@ -266,6 +266,10 @@ def test_web_preview_failures_do_not_create_tasks(client, settings, monkeypatch)
 def test_web_google_doc_flow_keeps_csrf_and_390px_controls(client) -> None:
     client.post("/login", data={"username": "admin", "password": "admin-password"})
     dashboard = client.get("/pmt")
+    assert 'data-bs-toggle="dropdown"' in dashboard.text
+    assert 'data-bs-target="#newTaskModal"' in dashboard.text
+    assert "Buat manual" in dashboard.text
+    assert "Dari Google Docs" in dashboard.text
     assert "/pmt/tasks/from-google-doc" in dashboard.text
     intake = client.get("/pmt/tasks/from-google-doc")
     assert 'name="csrf_token"' in intake.text
