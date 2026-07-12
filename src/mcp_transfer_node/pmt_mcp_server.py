@@ -93,6 +93,7 @@ def pmt_get_task_context(task_ref: str) -> dict[str, object]:
     """Return task requirements, HMX context, checks, claim, and recent audit events."""
     task = _request("GET", f"/tasks/{task_ref}")["task"]
     events = _request("GET", f"/tasks/{task_ref}/events")["events"]
+    evidence = _request("GET", f"/tasks/{task_ref}/evidence")["evidence"]
     return {
         "task": task,
         "hmx": {
@@ -109,6 +110,7 @@ def pmt_get_task_context(task_ref: str) -> dict[str, object]:
             "deployment": True,
         },
         "events": events,
+        "evidence": evidence,
     }
 
 
@@ -140,6 +142,79 @@ def pmt_create_task(
             "target_branch": target_branch,
             "acceptance_criteria": acceptance_criteria or [],
             "required_checks": required_checks or [],
+        },
+    )
+
+
+@mcp.tool()
+def pmt_update_task(
+    task_ref: str,
+    title: str | None = None,
+    description: str | None = None,
+    project: str | None = None,
+    module: str | None = None,
+    menu: str | None = None,
+    assignee: str | None = None,
+    priority: str | None = None,
+    required_checks: list[str] | None = None,
+    target_branch: str | None = None,
+    source_branch: str | None = None,
+    commit_ref: str | None = None,
+    mr_url: str | None = None,
+    pipeline_url: str | None = None,
+) -> dict[str, object]:
+    """Update selected task metadata, branch, commit, MR, or pipeline references."""
+    values = {
+        "title": title,
+        "description": description,
+        "project": project,
+        "module": module,
+        "menu": menu,
+        "assignee": assignee,
+        "priority": priority,
+        "required_checks": required_checks,
+        "target_branch": target_branch,
+        "source_branch": source_branch,
+        "commit_ref": commit_ref,
+        "mr_url": mr_url,
+        "pipeline_url": pipeline_url,
+    }
+    return _request(
+        "PATCH",
+        f"/tasks/{task_ref}",
+        json_body={key: value for key, value in values.items() if value is not None},
+    )
+
+
+@mcp.tool()
+def pmt_add_acceptance_criterion(task_ref: str, text: str) -> dict[str, object]:
+    """Add one acceptance criterion to a task checklist."""
+    return _request("POST", f"/tasks/{task_ref}/criteria", json_body={"text": text})
+
+
+@mcp.tool()
+def pmt_toggle_acceptance_criterion(task_ref: str, criterion_id: str) -> dict[str, object]:
+    """Toggle one acceptance criterion between pending and completed."""
+    return _request("POST", f"/tasks/{task_ref}/criteria/{criterion_id}/toggle")
+
+
+@mcp.tool()
+def pmt_add_evidence(
+    task_ref: str,
+    evidence_type: str,
+    label: str = "",
+    url: str = "",
+    note: str = "",
+) -> dict[str, object]:
+    """Attach structured test, commit, MR, pipeline, screenshot, video, or note evidence."""
+    return _request(
+        "POST",
+        f"/tasks/{task_ref}/evidence",
+        json_body={
+            "evidence_type": evidence_type,
+            "label": label,
+            "url": url,
+            "note": note,
         },
     )
 

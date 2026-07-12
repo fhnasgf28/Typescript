@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.parse import urlparse
 
 TASK_STATUSES = {
     "inbox",
@@ -20,6 +21,17 @@ TASK_STATUSES = {
     "cancelled",
 }
 TASK_PRIORITIES = {"low", "normal", "high", "urgent"}
+EVIDENCE_TYPES = {"commit", "merge_request", "pipeline", "screenshot", "video", "test", "note"}
+ADMIN_STATUS_TRANSITIONS = {
+    "inbox": {"todo", "cancelled"},
+    "todo": {"inbox", "cancelled"},
+    "claimed": {"in_progress", "todo", "blocked", "cancelled"},
+    "in_progress": {"ready_for_review", "blocked", "todo", "cancelled"},
+    "ready_for_review": {"done", "todo", "blocked", "cancelled"},
+    "blocked": {"in_progress", "todo", "cancelled"},
+    "done": {"todo"},
+    "cancelled": {"inbox", "todo"},
+}
 
 
 def utcnow() -> datetime:
@@ -112,6 +124,18 @@ class PmtStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_task_events_task
                     ON task_events(task_id, id);
+                CREATE TABLE IF NOT EXISTS task_evidence (
+                    id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL REFERENCES tasks(id),
+                    evidence_type TEXT NOT NULL,
+                    label TEXT NOT NULL DEFAULT '',
+                    url TEXT NOT NULL DEFAULT '',
+                    note TEXT NOT NULL DEFAULT '',
+                    actor TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_task_evidence_task
+                    ON task_evidence(task_id, created_at);
                 CREATE TABLE IF NOT EXISTS agents (
                     agent_id TEXT PRIMARY KEY,
                     server_name TEXT NOT NULL,
@@ -148,6 +172,23 @@ class PmtStore:
                 );
                 """
             )
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                self._ensure_column(db, "tasks", "source_branch", "TEXT NOT NULL DEFAULT ''")
+                self._ensure_column(db, "tasks", "commit_ref", "TEXT NOT NULL DEFAULT ''")
+                self._ensure_column(db, "tasks", "mr_url", "TEXT NOT NULL DEFAULT ''")
+                self._ensure_column(db, "tasks", "pipeline_url", "TEXT NOT NULL DEFAULT ''")
+            except Exception:
+                db.rollback()
+                raise
+            else:
+                db.commit()
+
+    @staticmethod
+    def _ensure_column(db: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+        columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
+        if column not in columns:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -175,9 +216,52 @@ class PmtStore:
     @staticmethod
     def _task(row: sqlite3.Row) -> dict[str, Any]:
         result = dict(row)
-        result["acceptance_criteria"] = json.loads(result["acceptance_criteria"])
+        result["acceptance_criteria"] = PmtStore._criteria(
+            json.loads(result["acceptance_criteria"])
+        )
         result["required_checks"] = json.loads(result["required_checks"])
         return result
+
+    @staticmethod
+    def _criteria(items: list[Any]) -> list[dict[str, Any]]:
+        normalized: list[dict[str, Any]] = []
+        for index, item in enumerate(items):
+            if isinstance(item, str):
+                text = item.strip()
+                if text:
+                    normalized.append({"id": f"criterion-{index + 1}", "text": text, "done": False})
+                continue
+            if isinstance(item, dict) and str(item.get("text", "")).strip():
+                normalized.append(
+                    {
+                        "id": str(item.get("id") or f"criterion-{index + 1}"),
+                        "text": str(item["text"]).strip(),
+                        "done": bool(item.get("done", False)),
+                    }
+                )
+        return normalized
+
+    @staticmethod
+    def _validated_url(value: str) -> str:
+        url = value.strip()
+        if not url:
+            return ""
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("evidence URL must use http or https")
+        return url
+
+    @staticmethod
+    def _require_active_owner(row: sqlite3.Row, expected_owner: str | None) -> None:
+        if expected_owner is None:
+            return
+        lease = row["lease_expires_at"]
+        if (
+            row["claimed_by"] != expected_owner
+            or not lease
+            or datetime.fromisoformat(lease) <= utcnow()
+        ):
+            raise PermissionError("task detail writes require the active task owner")
 
     @staticmethod
     def _schedule(row: sqlite3.Row) -> dict[str, Any]:
@@ -246,7 +330,17 @@ class PmtStore:
                         data.priority,
                         "todo",
                         data.target_branch.strip() or "Human-Resources",
-                        json.dumps(list(data.acceptance_criteria)),
+                        json.dumps(
+                            [
+                                {
+                                    "id": f"criterion_{uuid.uuid4().hex}",
+                                    "text": text.strip(),
+                                    "done": False,
+                                }
+                                for text in data.acceptance_criteria
+                                if text.strip()
+                            ]
+                        ),
                         json.dumps(list(data.required_checks)),
                         now,
                         now,
@@ -326,6 +420,253 @@ class PmtStore:
             event["payload"] = json.loads(event["payload"])
             result.append(event)
         return result
+
+    def update_task(
+        self,
+        task_ref: str,
+        *,
+        actor: str,
+        title: str,
+        description: str = "",
+        project: str = "HMX",
+        module: str = "",
+        menu: str = "",
+        assignee: str = "",
+        priority: str = "normal",
+        required_checks: list[str] | tuple[str, ...] | None = None,
+        target_branch: str = "Human-Resources",
+        source_branch: str = "",
+        commit_ref: str = "",
+        mr_url: str = "",
+        pipeline_url: str = "",
+        expected_owner: str | None = None,
+        expected_version: int | None = None,
+    ) -> dict[str, Any]:
+        if not title.strip():
+            raise ValueError("title is required")
+        if priority not in TASK_PRIORITIES:
+            raise ValueError(f"invalid priority: {priority}")
+        mr_url = self._validated_url(mr_url)
+        pipeline_url = self._validated_url(pipeline_url)
+        with self._transaction() as db:
+            row = db.execute(
+                "SELECT * FROM tasks WHERE id=? OR task_key=?", (task_ref, task_ref)
+            ).fetchone()
+            if row is None:
+                raise KeyError(task_ref)
+            self._require_active_owner(row, expected_owner)
+            if expected_version is not None and row["version"] != expected_version:
+                raise PermissionError("task changed since it was loaded; refresh and retry")
+            values = {
+                "title": title.strip(),
+                "description": description.strip(),
+                "project": project.strip() or "HMX",
+                "module": module.strip(),
+                "menu": menu.strip(),
+                "assignee": assignee.strip(),
+                "priority": priority,
+                "required_checks": (
+                    row["required_checks"]
+                    if required_checks is None
+                    else json.dumps([check.strip() for check in required_checks if check.strip()])
+                ),
+                "target_branch": target_branch.strip() or "Human-Resources",
+                "source_branch": source_branch.strip(),
+                "commit_ref": commit_ref.strip(),
+                "mr_url": mr_url,
+                "pipeline_url": pipeline_url,
+            }
+            changed = {key: value for key, value in values.items() if value != row[key]}
+            if changed:
+                db.execute(
+                    """UPDATE tasks SET title=?,description=?,project=?,module=?,menu=?,assignee=?,
+                        priority=?,required_checks=?,target_branch=?,source_branch=?,commit_ref=?,mr_url=?,pipeline_url=?,
+                        version=version+1,updated_at=? WHERE id=?""",
+                    (*values.values(), iso(), row["id"]),
+                )
+                self._event(db, row["id"], "task.updated", actor, {"changed": changed})
+            updated = db.execute("SELECT * FROM tasks WHERE id=?", (row["id"],)).fetchone()
+            return self._task(updated)
+
+    def add_acceptance_criterion(
+        self, task_ref: str, text: str, actor: str, expected_owner: str | None = None
+    ) -> dict[str, Any]:
+        if not text.strip():
+            raise ValueError("criterion text is required")
+        with self._transaction() as db:
+            row = db.execute(
+                "SELECT * FROM tasks WHERE id=? OR task_key=?", (task_ref, task_ref)
+            ).fetchone()
+            if row is None:
+                raise KeyError(task_ref)
+            self._require_active_owner(row, expected_owner)
+            criteria = self._criteria(json.loads(row["acceptance_criteria"]))
+            criterion = {
+                "id": f"criterion_{uuid.uuid4().hex}",
+                "text": text.strip(),
+                "done": False,
+            }
+            criteria.append(criterion)
+            db.execute(
+                """UPDATE tasks SET acceptance_criteria=?,version=version+1,updated_at=?
+                    WHERE id=?""",
+                (json.dumps(criteria), iso(), row["id"]),
+            )
+            self._event(db, row["id"], "criterion.added", actor, criterion)
+            updated = db.execute("SELECT * FROM tasks WHERE id=?", (row["id"],)).fetchone()
+            return self._task(updated)
+
+    def toggle_acceptance_criterion(
+        self,
+        task_ref: str,
+        criterion_id: str,
+        actor: str,
+        expected_owner: str | None = None,
+    ) -> dict[str, Any]:
+        with self._transaction() as db:
+            row = db.execute(
+                "SELECT * FROM tasks WHERE id=? OR task_key=?", (task_ref, task_ref)
+            ).fetchone()
+            if row is None:
+                raise KeyError(task_ref)
+            self._require_active_owner(row, expected_owner)
+            criteria = self._criteria(json.loads(row["acceptance_criteria"]))
+            criterion = next((item for item in criteria if item["id"] == criterion_id), None)
+            if criterion is None:
+                raise KeyError(criterion_id)
+            criterion["done"] = not criterion["done"]
+            db.execute(
+                """UPDATE tasks SET acceptance_criteria=?,version=version+1,updated_at=?
+                    WHERE id=?""",
+                (json.dumps(criteria), iso(), row["id"]),
+            )
+            self._event(db, row["id"], "criterion.toggled", actor, criterion)
+            updated = db.execute("SELECT * FROM tasks WHERE id=?", (row["id"],)).fetchone()
+            return self._task(updated)
+
+    def admin_transition_task(
+        self, task_ref: str, target_status: str, actor: str, note: str = ""
+    ) -> dict[str, Any]:
+        if target_status not in TASK_STATUSES:
+            raise ValueError(f"invalid status: {target_status}")
+        with self._transaction() as db:
+            row = db.execute(
+                "SELECT * FROM tasks WHERE id=? OR task_key=?", (task_ref, task_ref)
+            ).fetchone()
+            if row is None:
+                raise KeyError(task_ref)
+            if target_status == row["status"]:
+                return self._task(row)
+            allowed = ADMIN_STATUS_TRANSITIONS.get(row["status"], set())
+            if target_status not in allowed:
+                raise ValueError(f"invalid manual transition: {row['status']} -> {target_status}")
+            if target_status in {"claimed", "in_progress"} and not row["claimed_by"]:
+                raise ValueError(f"{target_status} status requires an agent owner")
+            now = iso()
+            releases = target_status in {
+                "inbox",
+                "todo",
+                "ready_for_review",
+                "done",
+                "cancelled",
+            }
+            claimed_by = None if releases else row["claimed_by"]
+            lease = None if releases else row["lease_expires_at"]
+            db.execute(
+                """UPDATE tasks SET status=?,claimed_by=?,lease_expires_at=?,progress_note=?,
+                    blocker=?,version=version+1,updated_at=? WHERE id=?""",
+                (
+                    target_status,
+                    claimed_by,
+                    lease,
+                    note.strip(),
+                    note.strip() if target_status == "blocked" else "",
+                    now,
+                    row["id"],
+                ),
+            )
+            if releases and row["claimed_by"]:
+                db.execute(
+                    """UPDATE task_runs SET status=?,finished_at=? WHERE task_id=?
+                        AND finished_at IS NULL""",
+                    (target_status, now, row["id"]),
+                )
+                db.execute(
+                    """UPDATE agents SET current_task_id=NULL,status='online',updated_at=?
+                        WHERE agent_id=?""",
+                    (now, row["claimed_by"]),
+                )
+            self._event(
+                db,
+                row["id"],
+                f"task.{target_status}",
+                actor,
+                {"note": note, "manual": True},
+            )
+            updated = db.execute("SELECT * FROM tasks WHERE id=?", (row["id"],)).fetchone()
+            return self._task(updated)
+
+    def add_evidence(
+        self,
+        task_ref: str,
+        *,
+        evidence_type: str,
+        label: str,
+        url: str,
+        note: str,
+        actor: str,
+        expected_owner: str | None = None,
+    ) -> dict[str, Any]:
+        if evidence_type not in EVIDENCE_TYPES:
+            raise ValueError(f"invalid evidence type: {evidence_type}")
+        url = self._validated_url(url)
+        if not label.strip() and not url and not note.strip():
+            raise ValueError("evidence requires a label, URL, or note")
+        with self._transaction() as db:
+            row = db.execute(
+                "SELECT * FROM tasks WHERE id=? OR task_key=?", (task_ref, task_ref)
+            ).fetchone()
+            if row is None:
+                raise KeyError(task_ref)
+            self._require_active_owner(row, expected_owner)
+            evidence_id = f"evidence_{uuid.uuid4().hex}"
+            created_at = iso()
+            db.execute(
+                """INSERT INTO task_evidence(
+                    id,task_id,evidence_type,label,url,note,actor,created_at
+                ) VALUES(?,?,?,?,?,?,?,?)""",
+                (
+                    evidence_id,
+                    row["id"],
+                    evidence_type,
+                    label.strip(),
+                    url,
+                    note.strip(),
+                    actor,
+                    created_at,
+                ),
+            )
+            payload = {
+                "id": evidence_id,
+                "evidence_type": evidence_type,
+                "label": label.strip(),
+                "url": url,
+                "note": note.strip(),
+            }
+            self._event(db, row["id"], "evidence.added", actor, payload)
+            return {**payload, "actor": actor, "created_at": created_at}
+
+    def list_evidence(self, task_ref: str) -> list[dict[str, Any]]:
+        task = self.get_task(task_ref)
+        if task is None:
+            raise KeyError(task_ref)
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT id,evidence_type,label,url,note,actor,created_at
+                    FROM task_evidence WHERE task_id=? ORDER BY created_at DESC""",
+                (task["id"],),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def register_agent(
         self, agent_id: str, server_name: str, capabilities: list[str] | None = None

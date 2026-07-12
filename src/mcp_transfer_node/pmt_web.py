@@ -7,7 +7,12 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from mcp_transfer_node.config import TransferSettings
-from mcp_transfer_node.pmt_store import PmtStore, TaskInput
+from mcp_transfer_node.pmt_store import (
+    ADMIN_STATUS_TRANSITIONS,
+    EVIDENCE_TYPES,
+    PmtStore,
+    TaskInput,
+)
 
 TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
@@ -81,5 +86,162 @@ def create_pmt_web_router(settings: TransferSettings) -> APIRouter:
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         return RedirectResponse("/pmt", status_code=status.HTTP_303_SEE_OTHER)
+
+    @router.get("/tasks/{task_ref}", response_class=HTMLResponse)
+    def task_detail(request: Request, task_ref: str):
+        _require_login(request)
+        task = store.get_task(task_ref)
+        if task is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Task tidak ditemukan")
+        allowed_statuses = set(ADMIN_STATUS_TRANSITIONS.get(task["status"], set()))
+        if not task["claimed_by"]:
+            allowed_statuses -= {"claimed", "in_progress"}
+        return TEMPLATES.TemplateResponse(
+            request,
+            "pmt_task_detail.html",
+            {
+                "settings": settings,
+                "task": task,
+                "events": store.task_events(task_ref),
+                "evidence": store.list_evidence(task_ref),
+                "statuses": [task["status"]]
+                + [
+                    status_name
+                    for status_name in (
+                        "inbox",
+                        "todo",
+                        "claimed",
+                        "in_progress",
+                        "ready_for_review",
+                        "blocked",
+                        "done",
+                        "cancelled",
+                    )
+                    if status_name in allowed_statuses
+                ],
+                "evidence_types": sorted(EVIDENCE_TYPES),
+            },
+        )
+
+    @router.post("/tasks/{task_ref}/edit")
+    def edit_task(
+        request: Request,
+        task_ref: str,
+        title: str = Form(...),
+        description: str = Form(default=""),
+        project: str = Form(default="HMX"),
+        module: str = Form(default=""),
+        menu: str = Form(default=""),
+        assignee: str = Form(default=""),
+        priority: str = Form(default="normal"),
+        required_checks: str = Form(default=""),
+        target_branch: str = Form(default="Human-Resources"),
+        source_branch: str = Form(default=""),
+        commit_ref: str = Form(default=""),
+        mr_url: str = Form(default=""),
+        pipeline_url: str = Form(default=""),
+        version: int = Form(...),
+    ) -> RedirectResponse:
+        _require_login(request)
+        try:
+            store.update_task(
+                task_ref,
+                actor="web-admin",
+                title=title,
+                description=description,
+                project=project,
+                module=module,
+                menu=menu,
+                assignee=assignee,
+                priority=priority,
+                required_checks=[
+                    item.strip()
+                    for line in required_checks.splitlines()
+                    for item in line.split(",")
+                    if item.strip()
+                ],
+                target_branch=target_branch,
+                source_branch=source_branch,
+                commit_ref=commit_ref,
+                mr_url=mr_url,
+                pipeline_url=pipeline_url,
+                expected_version=version,
+            )
+        except KeyError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Task tidak ditemukan") from exc
+        except (PermissionError, ValueError) as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        return RedirectResponse(f"/pmt/tasks/{task_ref}", status_code=status.HTTP_303_SEE_OTHER)
+
+    @router.post("/tasks/{task_ref}/status")
+    def update_status(
+        request: Request,
+        task_ref: str,
+        task_status: str = Form(...),
+        note: str = Form(default=""),
+    ) -> RedirectResponse:
+        _require_login(request)
+        try:
+            store.admin_transition_task(task_ref, task_status, "web-admin", note)
+        except KeyError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Task tidak ditemukan") from exc
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return RedirectResponse(
+            f"/pmt/tasks/{task_ref}#activity", status_code=status.HTTP_303_SEE_OTHER
+        )
+
+    @router.post("/tasks/{task_ref}/criteria")
+    def add_criterion(request: Request, task_ref: str, text: str = Form(...)) -> RedirectResponse:
+        _require_login(request)
+        try:
+            store.add_acceptance_criterion(task_ref, text, "web-admin")
+        except KeyError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Task tidak ditemukan") from exc
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return RedirectResponse(
+            f"/pmt/tasks/{task_ref}#acceptance", status_code=status.HTTP_303_SEE_OTHER
+        )
+
+    @router.post("/tasks/{task_ref}/criteria/{criterion_id}/toggle")
+    def toggle_criterion(request: Request, task_ref: str, criterion_id: str) -> RedirectResponse:
+        _require_login(request)
+        try:
+            store.toggle_acceptance_criterion(task_ref, criterion_id, "web-admin")
+        except KeyError as exc:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, detail="Task/criterion tidak ditemukan"
+            ) from exc
+        return RedirectResponse(
+            f"/pmt/tasks/{task_ref}#acceptance", status_code=status.HTTP_303_SEE_OTHER
+        )
+
+    @router.post("/tasks/{task_ref}/evidence")
+    def add_evidence(
+        request: Request,
+        task_ref: str,
+        evidence_type: str = Form(...),
+        label: str = Form(default=""),
+        url: str = Form(default=""),
+        note: str = Form(default=""),
+    ) -> RedirectResponse:
+        _require_login(request)
+        try:
+            store.add_evidence(
+                task_ref,
+                evidence_type=evidence_type,
+                label=label,
+                url=url,
+                note=note,
+                actor="web-admin",
+            )
+        except KeyError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Task tidak ditemukan") from exc
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        return RedirectResponse(
+            f"/pmt/tasks/{task_ref}#evidence", status_code=status.HTTP_303_SEE_OTHER
+        )
 
     return router

@@ -29,6 +29,33 @@ class TaskCreate(BaseModel):
     required_checks: list[str] = Field(default_factory=list, max_length=100)
 
 
+class TaskUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=300)
+    description: str | None = Field(default=None, max_length=20_000)
+    project: str | None = Field(default=None, max_length=120)
+    module: str | None = Field(default=None, max_length=120)
+    menu: str | None = Field(default=None, max_length=240)
+    assignee: str | None = Field(default=None, max_length=120)
+    priority: str | None = None
+    required_checks: list[str] | None = Field(default=None, max_length=100)
+    target_branch: str | None = Field(default=None, max_length=240)
+    source_branch: str | None = Field(default=None, max_length=240)
+    commit_ref: str | None = Field(default=None, max_length=240)
+    mr_url: str | None = Field(default=None, max_length=2_000)
+    pipeline_url: str | None = Field(default=None, max_length=2_000)
+
+
+class CriterionCreate(BaseModel):
+    text: str = Field(min_length=1, max_length=2_000)
+
+
+class EvidenceCreate(BaseModel):
+    evidence_type: str
+    label: str = Field(default="", max_length=300)
+    url: str = Field(default="", max_length=2_000)
+    note: str = Field(default="", max_length=20_000)
+
+
 class AgentRegistration(BaseModel):
     agent_id: str = Field(min_length=1, max_length=120)
     server_name: str = Field(min_length=1, max_length=120)
@@ -171,6 +198,40 @@ def create_pmt_api_router(settings: TransferSettings) -> APIRouter:
             translate_error(KeyError(task_ref))
         return success_response({"task": task})
 
+    @router.patch("/tasks/{task_ref}")
+    def update_task(task_ref: str, payload: TaskUpdate, peer: AllowedPeer = Depends(require_agent)):
+        current = store.get_task(task_ref)
+        if current is None:
+            translate_error(KeyError(task_ref))
+        values = {
+            key: value
+            for key, value in payload.model_dump(exclude_unset=True).items()
+            if value is not None
+        }
+        try:
+            task = store.update_task(
+                task_ref,
+                actor=peer.name,
+                title=values.get("title", current["title"]),
+                description=values.get("description", current["description"]),
+                project=values.get("project", current["project"]),
+                module=values.get("module", current["module"]),
+                menu=values.get("menu", current["menu"]),
+                assignee=values.get("assignee", current["assignee"]),
+                priority=values.get("priority", current["priority"]),
+                required_checks=values.get("required_checks", current["required_checks"]),
+                target_branch=values.get("target_branch", current["target_branch"]),
+                source_branch=values.get("source_branch", current["source_branch"]),
+                commit_ref=values.get("commit_ref", current["commit_ref"]),
+                mr_url=values.get("mr_url", current["mr_url"]),
+                pipeline_url=values.get("pipeline_url", current["pipeline_url"]),
+                expected_owner=peer.name,
+                expected_version=current["version"],
+            )
+        except (KeyError, PermissionError, ValueError) as exc:
+            translate_error(exc)
+        return success_response({"task": task})
+
     @router.get("/tasks/{task_ref}/events")
     def get_task_events(task_ref: str, _: AllowedPeer = Depends(require_agent)):
         try:
@@ -178,6 +239,56 @@ def create_pmt_api_router(settings: TransferSettings) -> APIRouter:
         except KeyError as exc:
             translate_error(exc)
         return success_response({"events": events})
+
+    @router.post("/tasks/{task_ref}/criteria", status_code=status.HTTP_201_CREATED)
+    def add_criterion(
+        task_ref: str, payload: CriterionCreate, peer: AllowedPeer = Depends(require_agent)
+    ):
+        try:
+            task = store.add_acceptance_criterion(
+                task_ref, payload.text, peer.name, expected_owner=peer.name
+            )
+        except (KeyError, PermissionError, ValueError) as exc:
+            translate_error(exc)
+        return success_response({"task": task})
+
+    @router.post("/tasks/{task_ref}/criteria/{criterion_id}/toggle")
+    def toggle_criterion(
+        task_ref: str, criterion_id: str, peer: AllowedPeer = Depends(require_agent)
+    ):
+        try:
+            task = store.toggle_acceptance_criterion(
+                task_ref, criterion_id, peer.name, expected_owner=peer.name
+            )
+        except (KeyError, PermissionError, ValueError) as exc:
+            translate_error(exc)
+        return success_response({"task": task})
+
+    @router.get("/tasks/{task_ref}/evidence")
+    def get_evidence(task_ref: str, _: AllowedPeer = Depends(require_agent)):
+        try:
+            evidence = store.list_evidence(task_ref)
+        except KeyError as exc:
+            translate_error(exc)
+        return success_response({"evidence": evidence})
+
+    @router.post("/tasks/{task_ref}/evidence", status_code=status.HTTP_201_CREATED)
+    def add_evidence(
+        task_ref: str, payload: EvidenceCreate, peer: AllowedPeer = Depends(require_agent)
+    ):
+        try:
+            evidence = store.add_evidence(
+                task_ref,
+                evidence_type=payload.evidence_type,
+                label=payload.label,
+                url=payload.url,
+                note=payload.note,
+                actor=peer.name,
+                expected_owner=peer.name,
+            )
+        except (KeyError, PermissionError, ValueError) as exc:
+            translate_error(exc)
+        return success_response({"evidence": evidence})
 
     @router.post("/agents/register")
     def register_agent(payload: AgentRegistration, peer: AllowedPeer = Depends(require_agent)):

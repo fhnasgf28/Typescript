@@ -250,6 +250,42 @@ body.pmt-body {
   border-radius: 0.45rem;
 }
 
+.place-items-center { place-items: center; }
+
+.pmt-timeline {
+  position: relative;
+  padding-left: 1.5rem;
+}
+
+.pmt-timeline::before {
+  position: absolute;
+  top: 0.35rem;
+  bottom: 0.35rem;
+  left: 0.38rem;
+  width: 1px;
+  content: "";
+  background: var(--pmt-border);
+}
+
+.pmt-timeline-item {
+  position: relative;
+  padding: 0 0 1.6rem 0.5rem;
+}
+
+.pmt-timeline-item:last-child { padding-bottom: 0; }
+
+.pmt-timeline-dot {
+  position: absolute;
+  top: 0.3rem;
+  left: -1.45rem;
+  width: 0.72rem;
+  height: 0.72rem;
+  background: #fff;
+  border: 0.2rem solid var(--pmt-primary);
+  border-radius: 50%;
+  box-shadow: 0 0 0 0.2rem #eef2ff;
+}
+
 .pmt-empty {
   display: grid;
   min-height: 10rem;

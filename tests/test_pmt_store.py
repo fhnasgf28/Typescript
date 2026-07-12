@@ -75,6 +75,112 @@ def test_owned_task_flow_and_audit_events(settings):
     }
 
 
+def test_task_detail_workflow_tracks_checklist_evidence_and_updates(settings):
+    store = PmtStore(settings.pmt_db_path)
+    store.initialize()
+    task = store.create_task(
+        TaskInput(
+            title="Employee access",
+            acceptance_criteria=("Self Service reads own employee",),
+            required_checks=("access-matrix", "prepush-quality"),
+        )
+    )
+
+    criterion = task["acceptance_criteria"][0]
+    assert criterion["done"] is False
+    updated = store.update_task(
+        task["task_key"],
+        actor="web-admin",
+        title="Employee access rights",
+        description="Restrict employee visibility",
+        project="HMX",
+        module="core_hr",
+        menu="Employee",
+        assignee="Farhan",
+        priority="high",
+        target_branch="Human-Resources",
+        source_branch="feat/employee-access",
+        commit_ref="abc1234",
+        mr_url="https://gitlab.example.test/hmx/-/merge_requests/1",
+        pipeline_url="https://gitlab.example.test/hmx/-/pipelines/2",
+    )
+    checked = store.toggle_acceptance_criterion(task["task_key"], criterion["id"], "web-admin")
+    with_second = store.add_acceptance_criterion(
+        task["task_key"], "Supervisor reads subordinates", "web-admin"
+    )
+    evidence = store.add_evidence(
+        task["task_key"],
+        evidence_type="test",
+        label="Access matrix passed",
+        url="https://example.test/evidence/1",
+        note="8 cases passed",
+        actor="web-admin",
+    )
+
+    assert updated["title"] == "Employee access rights"
+    assert updated["source_branch"] == "feat/employee-access"
+    assert checked["acceptance_criteria"][0]["done"] is True
+    assert len(with_second["acceptance_criteria"]) == 2
+    assert evidence["evidence_type"] == "test"
+    assert store.list_evidence(task["task_key"])[0]["label"] == "Access matrix passed"
+    event_types = {event["event_type"] for event in store.task_events(task["task_key"])}
+    assert {"task.updated", "criterion.toggled", "criterion.added", "evidence.added"} <= event_types
+
+
+def test_task_detail_rejects_unsafe_evidence_url(settings):
+    store = PmtStore(settings.pmt_db_path)
+    store.initialize()
+    task = store.create_task(TaskInput(title="Unsafe URL"))
+
+    with pytest.raises(ValueError, match="http or https"):
+        store.add_evidence(
+            task["task_key"],
+            evidence_type="note",
+            label="bad",
+            url="javascript:alert(1)",
+            note="",
+            actor="web-admin",
+        )
+
+
+def test_task_update_rejects_stale_version(settings):
+    store = PmtStore(settings.pmt_db_path)
+    store.initialize()
+    task = store.create_task(TaskInput(title="Versioned task"))
+    fields = {
+        "actor": "web-admin",
+        "description": "",
+        "project": "HMX",
+        "module": "core_hr",
+        "menu": "",
+        "assignee": "",
+        "priority": "normal",
+        "target_branch": "Human-Resources",
+        "source_branch": "",
+        "commit_ref": "",
+        "mr_url": "",
+        "pipeline_url": "",
+    }
+    store.update_task(task["task_key"], title="First update", expected_version=1, **fields)
+
+    with pytest.raises(PermissionError, match="changed since"):
+        store.update_task(task["task_key"], title="Stale update", expected_version=1, **fields)
+
+
+def test_manual_status_transition_releases_agent_claim(settings):
+    store = PmtStore(settings.pmt_db_path)
+    store.initialize()
+    task = store.create_task(TaskInput(title="Release me"))
+    store.register_agent("agent-a", "server-a")
+    store.claim_task(task["task_key"], "agent-a", "release-claim", 600)
+
+    released = store.admin_transition_task(task["task_key"], "todo", "web-admin", "Return to queue")
+
+    assert released["status"] == "todo"
+    assert released["claimed_by"] is None
+    assert released["lease_expires_at"] is None
+
+
 def test_schedule_claim_and_finish(settings):
     store = PmtStore(settings.pmt_db_path)
     store.initialize()

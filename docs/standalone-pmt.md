@@ -6,7 +6,7 @@ Standalone PMT adds a central task-orchestration layer to MCP Transfer Node. One
 
 The MVP is deliberately small:
 
-- authenticated Web dashboard and task creation
+- authenticated Web dashboard, task detail, editing, acceptance checklist, evidence, and activity timeline
 - versioned agent REST API
 - remote stdio MCP adapter for each OpenClaw server
 - SQLite persistence with WAL mode
@@ -162,6 +162,10 @@ Read/context:
 Task writes:
 
 - `pmt_create_task`
+- `pmt_update_task`
+- `pmt_add_acceptance_criterion`
+- `pmt_toggle_acceptance_criterion`
+- `pmt_add_evidence`
 - `pmt_register_agent`
 - `pmt_claim_task`
 - `pmt_task_heartbeat`
@@ -294,7 +298,7 @@ Use one system cron or timer on the **central PMT server** to invoke the worker 
 - Schedules are interval-based, not full cron expressions.
 - Sheet identity currently includes its row number. A stable source UUID column is recommended before rows are frequently reordered.
 - No attachment upload, webhook receiver, GitLab write, Sheet write-back, notification send, or deployment action is implemented.
-- Evidence records, approval requests, task dependencies, and sprint analytics remain follow-up modules.
+- Approval requests, task dependencies, evidence verdict automation, and sprint analytics remain follow-up modules.
 
 ## Next hardening milestones
 

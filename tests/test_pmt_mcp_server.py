@@ -30,6 +30,57 @@ def test_pmt_mcp_maps_agent_identity_and_claim_payload(monkeypatch):
     ]
 
 
+def test_pmt_mcp_maps_task_detail_writes(monkeypatch):
+    calls = []
+
+    def fake_request(method, path, *, json_body=None, params=None):
+        calls.append((method, path, json_body, params))
+        return {"task": {"task_key": "PMT-0001"}}
+
+    monkeypatch.setattr(pmt_mcp_server, "_request", fake_request)
+
+    pmt_mcp_server.pmt_update_task(
+        "PMT-0001",
+        project="HMX",
+        module="core_hr",
+        target_branch="Human-Resources",
+        source_branch="feat/detail",
+    )
+    pmt_mcp_server.pmt_add_acceptance_criterion("PMT-0001", "Tests pass")
+    pmt_mcp_server.pmt_add_evidence("PMT-0001", "test", label="Pre-push", note="Passed")
+
+    assert calls == [
+        (
+            "PATCH",
+            "/tasks/PMT-0001",
+            {
+                "project": "HMX",
+                "module": "core_hr",
+                "target_branch": "Human-Resources",
+                "source_branch": "feat/detail",
+            },
+            None,
+        ),
+        (
+            "POST",
+            "/tasks/PMT-0001/criteria",
+            {"text": "Tests pass"},
+            None,
+        ),
+        (
+            "POST",
+            "/tasks/PMT-0001/evidence",
+            {
+                "evidence_type": "test",
+                "label": "Pre-push",
+                "url": "",
+                "note": "Passed",
+            },
+            None,
+        ),
+    ]
+
+
 def test_pmt_mcp_requires_https_for_remote_api(monkeypatch):
     monkeypatch.setenv("MCP_PMT_API_URL", "http://pmt.example.test")
     monkeypatch.setenv("MCP_PMT_API_TOKEN", "secret")
