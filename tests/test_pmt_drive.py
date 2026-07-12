@@ -30,7 +30,9 @@ from mcp_transfer_node.pmt_sheet import SheetSyncBusy, sync_google_sheet
 FILE_ID = "sheet_Abc-123"
 CSV_URL = f"https://docs.google.com/spreadsheets/d/{FILE_ID}/export?format=csv&gid=0"
 RESOURCE_ID = "resource_abc-123"
-RESOURCE_URI = f"https://www.googleapis.com/drive/v3/files/{FILE_ID}"
+RESOURCE_URI = (
+    f"https://www.googleapis.com/drive/v3/files/{FILE_ID}?alt=json&supportsAllDrives=true"
+)
 
 
 def drive_settings(settings):
@@ -99,6 +101,39 @@ async def test_watch_registration_contract_is_pinned_bounded_and_secret_safe(set
     row = store.get_drive_channel(result["channel_id"])
     assert row["token_hash"] == token_hash(captured["payload"]["token"])
     assert captured["payload"]["token"] not in json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_watch_registration_rejects_unexpected_resource_uri_query(settings):
+    configured = drive_settings(settings)
+    store = PmtStore(configured.pmt_db_path)
+    store.initialize()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        if str(request.url).endswith("/channels/stop"):
+            return httpx.Response(204, request=request)
+        return httpx.Response(
+            200,
+            json={
+                "id": payload["id"],
+                "resourceId": RESOURCE_ID,
+                "resourceUri": (
+                    f"https://www.googleapis.com/drive/v3/files/{FILE_ID}"
+                    "?alt=media&supportsAllDrives=true"
+                ),
+                "expiration": payload["expiration"],
+            },
+            request=request,
+        )
+
+    with pytest.raises(DriveWatchError, match="unexpected resource URI"):
+        await register_drive_watch(
+            store,
+            configured,
+            transport=httpx.MockTransport(handler),
+            access_token_provider=fake_token,
+        )
 
 
 @pytest.mark.asyncio

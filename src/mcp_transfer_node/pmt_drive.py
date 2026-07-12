@@ -11,7 +11,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qsl, quote, urlsplit
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request, status
@@ -66,6 +66,16 @@ def _validate_resource_uri(uri: str, file_id: str) -> str:
         raise DriveWatchError("Google Drive returned an invalid resource URI")
     parsed = urlsplit(uri)
     expected_path = f"/drive/v3/files/{quote(file_id, safe='')}"
+    try:
+        query = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True)
+    except ValueError as exc:
+        raise DriveWatchError("Google Drive returned an invalid resource URI") from exc
+    query_values = dict(query)
+    query_is_valid = not query or (
+        len(query) == 2
+        and len(query_values) == 2
+        and query_values == {"alt": "json", "supportsAllDrives": "true"}
+    )
     if (
         parsed.scheme != "https"
         or parsed.hostname != "www.googleapis.com"
@@ -73,7 +83,7 @@ def _validate_resource_uri(uri: str, file_id: str) -> str:
         or parsed.username is not None
         or parsed.password is not None
         or parsed.path != expected_path
-        or parsed.query
+        or not query_is_valid
         or parsed.fragment
     ):
         raise DriveWatchError("Google Drive returned an unexpected resource URI")
