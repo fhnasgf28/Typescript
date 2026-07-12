@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import secrets
 from pathlib import Path
 
 from fastapi import APIRouter, Form, HTTPException, Request, status
@@ -10,6 +12,8 @@ from mcp_transfer_node.config import TransferSettings
 from mcp_transfer_node.pmt_sheet import validate_sheet_url
 from mcp_transfer_node.pmt_store import (
     ADMIN_STATUS_TRANSITIONS,
+    APPROVAL_ACTION_TYPES,
+    APPROVAL_STATUSES,
     EVIDENCE_TYPES,
     PmtStore,
     TaskInput,
@@ -19,11 +23,22 @@ TEMPLATES = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
 
 def _require_login(request: Request) -> None:
-    if request.session.get("authenticated") is not True:
+    if request.session.get("authenticated") is not True or not request.session.get("principal"):
         raise HTTPException(
             status_code=status.HTTP_303_SEE_OTHER,
             headers={"Location": "/login"},
         )
+
+
+def _principal(request: Request) -> str:
+    _require_login(request)
+    return str(request.session["principal"])
+
+
+def _require_csrf(request: Request, token: str) -> None:
+    expected = str(request.session.get("csrf_token", ""))
+    if not expected or not secrets.compare_digest(expected, token):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="CSRF token tidak valid")
 
 
 def create_pmt_web_router(settings: TransferSettings) -> APIRouter:
@@ -63,6 +78,7 @@ def create_pmt_web_router(settings: TransferSettings) -> APIRouter:
                 "online_agents": sum(
                     agent["effective_status"] in {"online", "busy", "draining"} for agent in agents
                 ),
+                "csrf_token": request.session["csrf_token"],
             },
         )
 
@@ -86,6 +102,7 @@ def create_pmt_web_router(settings: TransferSettings) -> APIRouter:
                         "disabled",
                     )
                 },
+                "csrf_token": request.session["csrf_token"],
             },
         )
 
@@ -94,10 +111,12 @@ def create_pmt_web_router(settings: TransferSettings) -> APIRouter:
         request: Request,
         agent_id: str,
         mode: str = Form(...),
+        csrf_token: str = Form(...),
     ) -> RedirectResponse:
         _require_login(request)
+        _require_csrf(request, csrf_token)
         try:
-            store.set_agent_mode(agent_id, mode, "web-admin")
+            store.set_agent_mode(agent_id, mode, _principal(request))
         except KeyError as exc:
             raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Agent tidak ditemukan") from exc
         except ValueError as exc:
@@ -105,9 +124,11 @@ def create_pmt_web_router(settings: TransferSettings) -> APIRouter:
         return RedirectResponse("/pmt/agents", status_code=status.HTTP_303_SEE_OTHER)
 
     @router.post("/agents/reconcile-leases")
-    def reconcile_agent_leases(request: Request) -> RedirectResponse:
+    def reconcile_agent_leases(request: Request, csrf_token: str = Form(...)) -> RedirectResponse:
         _require_login(request)
-        store.reconcile_expired_leases("web-admin")
+        _require_csrf(request, csrf_token)
+        store.reconcile_expired_leases(_principal(request))
+        store.reconcile_expired_approval_leases(_principal(request))
         return RedirectResponse("/pmt/agents", status_code=status.HTTP_303_SEE_OTHER)
 
     @router.get("/sync", response_class=HTMLResponse)
@@ -125,6 +146,7 @@ def create_pmt_web_router(settings: TransferSettings) -> APIRouter:
                 "settings": settings,
                 "schedules": schedules,
                 "runs": store.list_schedule_runs(limit=50),
+                "csrf_token": request.session["csrf_token"],
             },
         )
 
@@ -138,8 +160,10 @@ def create_pmt_web_router(settings: TransferSettings) -> APIRouter:
         dev_status: str = Form(default="To-Do"),
         project: str = Form(default="HMX"),
         target_branch: str = Form(default="Human-Resources"),
+        csrf_token: str = Form(...),
     ) -> RedirectResponse:
         _require_login(request)
+        _require_csrf(request, csrf_token)
         try:
             csv_url = validate_sheet_url(csv_url)
             store.create_schedule(
@@ -153,7 +177,7 @@ def create_pmt_web_router(settings: TransferSettings) -> APIRouter:
                     "project": project,
                     "target_branch": target_branch,
                 },
-                "web-admin",
+                _principal(request),
             )
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
@@ -164,8 +188,10 @@ def create_pmt_web_router(settings: TransferSettings) -> APIRouter:
         request: Request,
         schedule_id: str,
         enabled: bool = Form(...),
+        csrf_token: str = Form(...),
     ) -> RedirectResponse:
         _require_login(request)
+        _require_csrf(request, csrf_token)
         try:
             store.set_schedule_enabled(schedule_id, enabled)
         except KeyError as exc:
@@ -173,6 +199,130 @@ def create_pmt_web_router(settings: TransferSettings) -> APIRouter:
                 status.HTTP_404_NOT_FOUND, detail="Schedule tidak ditemukan"
             ) from exc
         return RedirectResponse("/pmt/sync", status_code=status.HTTP_303_SEE_OTHER)
+
+    @router.get("/approvals", response_class=HTMLResponse)
+    def approval_center(request: Request, approval_status: str | None = None):
+        _require_login(request)
+        try:
+            approvals = store.list_approvals(status=approval_status, limit=200)
+        except ValueError:
+            approvals = store.list_approvals(limit=200)
+        return TEMPLATES.TemplateResponse(
+            request,
+            "pmt_approvals.html",
+            {
+                "settings": settings,
+                "approvals": approvals,
+                "selected": None,
+                "events": [],
+                "runs": [],
+                "action_types": sorted(APPROVAL_ACTION_TYPES),
+                "approval_statuses": sorted(APPROVAL_STATUSES),
+                "csrf_token": request.session["csrf_token"],
+                "principal": _principal(request),
+            },
+        )
+
+    @router.get("/approvals/{approval_ref}", response_class=HTMLResponse)
+    def approval_detail(request: Request, approval_ref: str):
+        _require_login(request)
+        approval = store.get_approval(approval_ref)
+        if approval is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Approval tidak ditemukan")
+        return TEMPLATES.TemplateResponse(
+            request,
+            "pmt_approvals.html",
+            {
+                "settings": settings,
+                "approvals": store.list_approvals(limit=200),
+                "selected": approval,
+                "events": store.approval_events(approval_ref),
+                "runs": store.list_approval_runs(approval_ref),
+                "action_types": sorted(APPROVAL_ACTION_TYPES),
+                "approval_statuses": sorted(APPROVAL_STATUSES),
+                "csrf_token": request.session["csrf_token"],
+                "principal": _principal(request),
+            },
+        )
+
+    @router.post("/approvals")
+    def create_approval(
+        request: Request,
+        csrf_token: str = Form(...),
+        action_type: str = Form(...),
+        title: str = Form(...),
+        reason: str = Form(default=""),
+        payload_json: str = Form(...),
+        idempotency_key: str = Form(...),
+        task_ref: str = Form(default=""),
+    ) -> RedirectResponse:
+        _require_login(request)
+        _require_csrf(request, csrf_token)
+        try:
+            payload = json.loads(payload_json)
+            if not isinstance(payload, dict):
+                raise ValueError("payload harus berupa JSON object")
+            approval = store.create_approval_request(
+                action_type=action_type,
+                title=title,
+                reason=reason,
+                payload=payload,
+                requested_by=_principal(request),
+                idempotency_key=idempotency_key,
+                task_ref=task_ref or None,
+                admin_request=True,
+            )
+        except json.JSONDecodeError as exc:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, detail="Payload JSON tidak valid"
+            ) from exc
+        except (KeyError, PermissionError, ValueError) as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        return RedirectResponse(
+            f"/pmt/approvals/{approval['approval_key']}",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+
+    @router.post("/approvals/{approval_ref}/decision")
+    def decide_approval(
+        request: Request,
+        approval_ref: str,
+        csrf_token: str = Form(...),
+        decision: str = Form(...),
+        note: str = Form(default=""),
+        confirm_key: str = Form(...),
+        version: int = Form(...),
+        approval_ttl_minutes: int = Form(default=60),
+    ) -> RedirectResponse:
+        _require_login(request)
+        _require_csrf(request, csrf_token)
+        approval = store.get_approval(approval_ref)
+        if approval is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Approval tidak ditemukan")
+        if not secrets.compare_digest(confirm_key.strip(), approval["approval_key"]):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail="Ketik approval key secara tepat untuk mengonfirmasi keputusan",
+            )
+        try:
+            store.decide_approval(
+                approval_ref,
+                decision,
+                _principal(request),
+                note,
+                version,
+                max(5, approval_ttl_minutes) * 60,
+            )
+        except KeyError as exc:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, detail="Approval tidak ditemukan"
+            ) from exc
+        except (PermissionError, ValueError) as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+        return RedirectResponse(
+            f"/pmt/approvals/{approval['approval_key']}",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
 
     @router.post("/tasks")
     def create_task(
@@ -185,8 +335,10 @@ def create_pmt_web_router(settings: TransferSettings) -> APIRouter:
         priority: str = Form(default="normal"),
         assignee: str = Form(default="Farhan"),
         target_branch: str = Form(default="Human-Resources"),
+        csrf_token: str = Form(...),
     ) -> RedirectResponse:
         _require_login(request)
+        _require_csrf(request, csrf_token)
         try:
             store.create_task(
                 TaskInput(
@@ -199,7 +351,7 @@ def create_pmt_web_router(settings: TransferSettings) -> APIRouter:
                     assignee=assignee,
                     target_branch=target_branch,
                 ),
-                actor="web-admin",
+                actor=_principal(request),
             )
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
@@ -238,6 +390,7 @@ def create_pmt_web_router(settings: TransferSettings) -> APIRouter:
                     if status_name in allowed_statuses
                 ],
                 "evidence_types": sorted(EVIDENCE_TYPES),
+                "csrf_token": request.session["csrf_token"],
             },
         )
 
@@ -259,12 +412,14 @@ def create_pmt_web_router(settings: TransferSettings) -> APIRouter:
         mr_url: str = Form(default=""),
         pipeline_url: str = Form(default=""),
         version: int = Form(...),
+        csrf_token: str = Form(...),
     ) -> RedirectResponse:
         _require_login(request)
+        _require_csrf(request, csrf_token)
         try:
             store.update_task(
                 task_ref,
-                actor="web-admin",
+                actor=_principal(request),
                 title=title,
                 description=description,
                 project=project,
@@ -297,36 +452,59 @@ def create_pmt_web_router(settings: TransferSettings) -> APIRouter:
         task_ref: str,
         task_status: str = Form(...),
         note: str = Form(default=""),
+        version: int = Form(...),
+        csrf_token: str = Form(...),
     ) -> RedirectResponse:
         _require_login(request)
+        _require_csrf(request, csrf_token)
         try:
-            store.admin_transition_task(task_ref, task_status, "web-admin", note)
+            store.admin_transition_task(
+                task_ref, task_status, _principal(request), note, expected_version=version
+            )
         except KeyError as exc:
             raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Task tidak ditemukan") from exc
-        except ValueError as exc:
+        except (PermissionError, ValueError) as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         return RedirectResponse(
             f"/pmt/tasks/{task_ref}#activity", status_code=status.HTTP_303_SEE_OTHER
         )
 
     @router.post("/tasks/{task_ref}/criteria")
-    def add_criterion(request: Request, task_ref: str, text: str = Form(...)) -> RedirectResponse:
+    def add_criterion(
+        request: Request,
+        task_ref: str,
+        text: str = Form(...),
+        version: int = Form(...),
+        csrf_token: str = Form(...),
+    ) -> RedirectResponse:
         _require_login(request)
+        _require_csrf(request, csrf_token)
         try:
-            store.add_acceptance_criterion(task_ref, text, "web-admin")
+            store.add_acceptance_criterion(
+                task_ref, text, _principal(request), expected_version=version
+            )
         except KeyError as exc:
             raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Task tidak ditemukan") from exc
-        except ValueError as exc:
+        except (PermissionError, ValueError) as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
         return RedirectResponse(
             f"/pmt/tasks/{task_ref}#acceptance", status_code=status.HTTP_303_SEE_OTHER
         )
 
     @router.post("/tasks/{task_ref}/criteria/{criterion_id}/toggle")
-    def toggle_criterion(request: Request, task_ref: str, criterion_id: str) -> RedirectResponse:
+    def toggle_criterion(
+        request: Request,
+        task_ref: str,
+        criterion_id: str,
+        version: int = Form(...),
+        csrf_token: str = Form(...),
+    ) -> RedirectResponse:
         _require_login(request)
+        _require_csrf(request, csrf_token)
         try:
-            store.toggle_acceptance_criterion(task_ref, criterion_id, "web-admin")
+            store.toggle_acceptance_criterion(
+                task_ref, criterion_id, _principal(request), expected_version=version
+            )
         except KeyError as exc:
             raise HTTPException(
                 status.HTTP_404_NOT_FOUND, detail="Task/criterion tidak ditemukan"
@@ -343,8 +521,11 @@ def create_pmt_web_router(settings: TransferSettings) -> APIRouter:
         label: str = Form(default=""),
         url: str = Form(default=""),
         note: str = Form(default=""),
+        version: int = Form(...),
+        csrf_token: str = Form(...),
     ) -> RedirectResponse:
         _require_login(request)
+        _require_csrf(request, csrf_token)
         try:
             store.add_evidence(
                 task_ref,
@@ -352,7 +533,8 @@ def create_pmt_web_router(settings: TransferSettings) -> APIRouter:
                 label=label,
                 url=url,
                 note=note,
-                actor="web-admin",
+                actor=_principal(request),
+                expected_version=version,
             )
         except KeyError as exc:
             raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Task tidak ditemukan") from exc

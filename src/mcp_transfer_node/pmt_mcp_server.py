@@ -94,6 +94,9 @@ def pmt_get_task_context(task_ref: str) -> dict[str, object]:
     task = _request("GET", f"/tasks/{task_ref}")["task"]
     events = _request("GET", f"/tasks/{task_ref}/events")["events"]
     evidence = _request("GET", f"/tasks/{task_ref}/evidence")["evidence"]
+    approvals = _request("GET", "/approvals", params={"task_ref": task_ref, "limit": 100})[
+        "approvals"
+    ]
     return {
         "task": task,
         "hmx": {
@@ -111,6 +114,7 @@ def pmt_get_task_context(task_ref: str) -> dict[str, object]:
         },
         "events": events,
         "evidence": evidence,
+        "approvals": approvals,
     }
 
 
@@ -149,6 +153,8 @@ def pmt_create_task(
 @mcp.tool()
 def pmt_update_task(
     task_ref: str,
+    run_id: str,
+    expected_version: int,
     title: str | None = None,
     description: str | None = None,
     project: str | None = None,
@@ -165,6 +171,8 @@ def pmt_update_task(
 ) -> dict[str, object]:
     """Update selected task metadata, branch, commit, MR, or pipeline references."""
     values = {
+        "run_id": run_id,
+        "expected_version": expected_version,
         "title": title,
         "description": description,
         "project": project,
@@ -187,21 +195,35 @@ def pmt_update_task(
 
 
 @mcp.tool()
-def pmt_add_acceptance_criterion(task_ref: str, text: str) -> dict[str, object]:
+def pmt_add_acceptance_criterion(
+    task_ref: str, text: str, run_id: str, expected_version: int
+) -> dict[str, object]:
     """Add one acceptance criterion to a task checklist."""
-    return _request("POST", f"/tasks/{task_ref}/criteria", json_body={"text": text})
+    return _request(
+        "POST",
+        f"/tasks/{task_ref}/criteria",
+        json_body={"text": text, "run_id": run_id, "expected_version": expected_version},
+    )
 
 
 @mcp.tool()
-def pmt_toggle_acceptance_criterion(task_ref: str, criterion_id: str) -> dict[str, object]:
+def pmt_toggle_acceptance_criterion(
+    task_ref: str, criterion_id: str, run_id: str, expected_version: int
+) -> dict[str, object]:
     """Toggle one acceptance criterion between pending and completed."""
-    return _request("POST", f"/tasks/{task_ref}/criteria/{criterion_id}/toggle")
+    return _request(
+        "POST",
+        f"/tasks/{task_ref}/criteria/{criterion_id}/toggle",
+        json_body={"run_id": run_id, "expected_version": expected_version},
+    )
 
 
 @mcp.tool()
 def pmt_add_evidence(
     task_ref: str,
     evidence_type: str,
+    run_id: str,
+    expected_version: int,
     label: str = "",
     url: str = "",
     note: str = "",
@@ -215,6 +237,8 @@ def pmt_add_evidence(
             "label": label,
             "url": url,
             "note": note,
+            "run_id": run_id,
+            "expected_version": expected_version,
         },
     )
 
@@ -331,6 +355,101 @@ def pmt_submit_for_review(task_ref: str, run_id: str, summary: str) -> dict[str,
 def pmt_release_task(task_ref: str, run_id: str, note: str = "") -> dict[str, object]:
     """Release a claimed task back to To-Do."""
     return _transition(task_ref, run_id, "todo", note)
+
+
+@mcp.tool()
+def pmt_request_approval(
+    action_type: str,
+    title: str,
+    idempotency_key: str,
+    payload: dict[str, Any],
+    reason: str = "",
+    task_ref: str = "",
+    task_run_id: str = "",
+) -> dict[str, object]:
+    """Request human approval for one immutable typed external action; this never executes it."""
+    return _request(
+        "POST",
+        "/approvals",
+        json_body={
+            "action_type": action_type,
+            "title": title,
+            "reason": reason,
+            "payload": payload,
+            "idempotency_key": idempotency_key,
+            "task_ref": task_ref or None,
+            "task_run_id": task_run_id or None,
+        },
+    )
+
+
+@mcp.tool()
+def pmt_get_approvals(status: str = "", task_ref: str = "", limit: int = 100) -> dict[str, object]:
+    """List approval requests and their current human/execution state."""
+    params: dict[str, Any] = {"limit": limit}
+    if status:
+        params["status"] = status
+    if task_ref:
+        params["task_ref"] = task_ref
+    return _request("GET", "/approvals", params=params)
+
+
+@mcp.tool()
+def pmt_get_approval(approval_ref: str) -> dict[str, object]:
+    """Read one approval request with immutable payload, events, and execution attempts."""
+    return _request("GET", f"/approvals/{approval_ref}")
+
+
+@mcp.tool()
+def pmt_claim_approved_action(
+    approval_ref: str, idempotency_key: str, lease_seconds: int = 900
+) -> dict[str, object]:
+    """Claim a human-approved action using a capability-scoped fenced execution lease."""
+    return _request(
+        "POST",
+        f"/approvals/{approval_ref}/claim",
+        json_body={
+            "executor_id": _agent_id(),
+            "idempotency_key": idempotency_key,
+            "lease_seconds": lease_seconds,
+        },
+    )
+
+
+@mcp.tool()
+def pmt_approval_heartbeat(
+    approval_ref: str, run_id: str, lease_seconds: int = 900
+) -> dict[str, object]:
+    """Extend an active fenced approval-execution lease."""
+    return _request(
+        "POST",
+        f"/approvals/{approval_ref}/heartbeat",
+        json_body={
+            "executor_id": _agent_id(),
+            "run_id": run_id,
+            "lease_seconds": lease_seconds,
+        },
+    )
+
+
+@mcp.tool()
+def pmt_finish_approved_action(
+    approval_ref: str,
+    run_id: str,
+    status: str,
+    result: dict[str, Any] | None = None,
+) -> dict[str, object]:
+    """Record a fenced approved action as succeeded or failed without storing secrets."""
+    return _request(
+        "POST",
+        f"/approvals/{approval_ref}/finish",
+        json_body={
+            "executor_id": _agent_id(),
+            "run_id": run_id,
+            "status": status,
+            "result": result or {},
+        },
+    )
 
 
 @mcp.tool()

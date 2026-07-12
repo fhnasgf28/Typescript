@@ -29,8 +29,8 @@ def client(settings: TransferSettings) -> Iterator[TestClient]:
     (settings.config_dir / "peers.json").write_text(
         '{"allowedPeers":[{"name":"server-a","tokenHash":"'
         + hash_token("valid-token")
-        + '","enabled":true}]}',
+        + '","enabled":true,"scopes":["approval.execute"]}]}',
         encoding="utf-8",
     )
-    with TestClient(create_app(settings)) as test_client:
+    with TestClient(create_app(settings), base_url="https://testserver") as test_client:
         yield test_client

@@ -26,7 +26,13 @@ def create_app(settings: TransferSettings | None = None) -> FastAPI:
     ensure_runtime_dirs(resolved)
     configure_logging(resolved.logs_dir)
     app = FastAPI(title="MCP Transfer Node")
-    app.add_middleware(SessionMiddleware, secret_key=resolved.session_secret, max_age=12 * 60 * 60)
+    app.add_middleware(
+        SessionMiddleware,
+        secret_key=resolved.session_secret,
+        max_age=12 * 60 * 60,
+        same_site="strict",
+        https_only=resolved.public_url.lower().startswith("https://"),
+    )
     app.mount(
         "/static",
         StaticFiles(directory=str(Path(__file__).parent / "static")),

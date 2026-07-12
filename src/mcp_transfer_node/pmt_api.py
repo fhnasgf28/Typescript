@@ -30,6 +30,8 @@ class TaskCreate(BaseModel):
 
 
 class TaskUpdate(BaseModel):
+    run_id: str = Field(min_length=1, max_length=120)
+    expected_version: int = Field(ge=1)
     title: str | None = Field(default=None, min_length=1, max_length=300)
     description: str | None = Field(default=None, max_length=20_000)
     project: str | None = Field(default=None, max_length=120)
@@ -47,6 +49,13 @@ class TaskUpdate(BaseModel):
 
 class CriterionCreate(BaseModel):
     text: str = Field(min_length=1, max_length=2_000)
+    run_id: str = Field(min_length=1, max_length=120)
+    expected_version: int = Field(ge=1)
+
+
+class TaskMutationContext(BaseModel):
+    run_id: str = Field(min_length=1, max_length=120)
+    expected_version: int = Field(ge=1)
 
 
 class EvidenceCreate(BaseModel):
@@ -54,6 +63,8 @@ class EvidenceCreate(BaseModel):
     label: str = Field(default="", max_length=300)
     url: str = Field(default="", max_length=2_000)
     note: str = Field(default="", max_length=20_000)
+    run_id: str = Field(min_length=1, max_length=120)
+    expected_version: int = Field(ge=1)
 
 
 class AgentRegistration(BaseModel):
@@ -101,6 +112,35 @@ class ScheduleFinish(BaseModel):
     result: dict[str, Any] = Field(default_factory=dict)
 
 
+class ApprovalRequestCreate(BaseModel):
+    action_type: str
+    title: str = Field(min_length=1, max_length=300)
+    reason: str = Field(default="", max_length=20_000)
+    payload: dict[str, Any] = Field(default_factory=dict)
+    idempotency_key: str = Field(min_length=1, max_length=240)
+    task_ref: str | None = Field(default=None, max_length=240)
+    task_run_id: str | None = Field(default=None, max_length=240)
+
+
+class ApprovalClaim(BaseModel):
+    executor_id: str = Field(min_length=1, max_length=120)
+    idempotency_key: str = Field(min_length=1, max_length=240)
+    lease_seconds: int = Field(default=900, ge=60, le=3600)
+
+
+class ApprovalHeartbeat(BaseModel):
+    executor_id: str = Field(min_length=1, max_length=120)
+    run_id: str = Field(min_length=1, max_length=120)
+    lease_seconds: int = Field(default=900, ge=60, le=3600)
+
+
+class ApprovalFinish(BaseModel):
+    executor_id: str = Field(min_length=1, max_length=120)
+    run_id: str = Field(min_length=1, max_length=120)
+    status: str
+    result: dict[str, Any] = Field(default_factory=dict)
+
+
 def _peers(settings: TransferSettings) -> list[AllowedPeer]:
     return load_allowed_peers(settings.config_dir / "peers.json")
 
@@ -139,6 +179,14 @@ def create_pmt_api_router(settings: TransferSettings) -> APIRouter:
                 detail=error_response(
                     "FORBIDDEN", "Agent may only act as its authenticated identity"
                 ),
+            )
+
+    def require_approval_scope(peer: AllowedPeer, approval: dict) -> None:
+        required_scope = f"approval.execute:{approval['action_type']}"
+        if "approval.execute" not in peer.scopes and required_scope not in peer.scopes:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=error_response("FORBIDDEN", "Peer is not scoped for this approval action"),
             )
 
     def translate_error(exc: Exception) -> None:
@@ -211,7 +259,7 @@ def create_pmt_api_router(settings: TransferSettings) -> APIRouter:
         values = {
             key: value
             for key, value in payload.model_dump(exclude_unset=True).items()
-            if value is not None
+            if value is not None and key not in {"run_id", "expected_version"}
         }
         try:
             task = store.update_task(
@@ -231,7 +279,8 @@ def create_pmt_api_router(settings: TransferSettings) -> APIRouter:
                 mr_url=values.get("mr_url", current["mr_url"]),
                 pipeline_url=values.get("pipeline_url", current["pipeline_url"]),
                 expected_owner=peer.name,
-                expected_version=current["version"],
+                expected_run_id=payload.run_id,
+                expected_version=payload.expected_version,
             )
         except (KeyError, PermissionError, ValueError) as exc:
             translate_error(exc)
@@ -251,7 +300,12 @@ def create_pmt_api_router(settings: TransferSettings) -> APIRouter:
     ):
         try:
             task = store.add_acceptance_criterion(
-                task_ref, payload.text, peer.name, expected_owner=peer.name
+                task_ref,
+                payload.text,
+                peer.name,
+                expected_owner=peer.name,
+                expected_run_id=payload.run_id,
+                expected_version=payload.expected_version,
             )
         except (KeyError, PermissionError, ValueError) as exc:
             translate_error(exc)
@@ -259,11 +313,19 @@ def create_pmt_api_router(settings: TransferSettings) -> APIRouter:
 
     @router.post("/tasks/{task_ref}/criteria/{criterion_id}/toggle")
     def toggle_criterion(
-        task_ref: str, criterion_id: str, peer: AllowedPeer = Depends(require_agent)
+        task_ref: str,
+        criterion_id: str,
+        payload: TaskMutationContext,
+        peer: AllowedPeer = Depends(require_agent),
     ):
         try:
             task = store.toggle_acceptance_criterion(
-                task_ref, criterion_id, peer.name, expected_owner=peer.name
+                task_ref,
+                criterion_id,
+                peer.name,
+                expected_owner=peer.name,
+                expected_run_id=payload.run_id,
+                expected_version=payload.expected_version,
             )
         except (KeyError, PermissionError, ValueError) as exc:
             translate_error(exc)
@@ -290,6 +352,8 @@ def create_pmt_api_router(settings: TransferSettings) -> APIRouter:
                 note=payload.note,
                 actor=peer.name,
                 expected_owner=peer.name,
+                expected_run_id=payload.run_id,
+                expected_version=payload.expected_version,
             )
         except (KeyError, PermissionError, ValueError) as exc:
             translate_error(exc)
@@ -298,6 +362,19 @@ def create_pmt_api_router(settings: TransferSettings) -> APIRouter:
     @router.post("/agents/register")
     def register_agent(payload: AgentRegistration, peer: AllowedPeer = Depends(require_agent)):
         actor_matches(peer, payload.agent_id)
+        requested_execution_capabilities = {
+            capability
+            for capability in payload.capabilities
+            if capability == "approval.execute" or capability.startswith("approval.execute:")
+        }
+        if any(
+            capability not in peer.scopes and "approval.execute" not in peer.scopes
+            for capability in requested_execution_capabilities
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=error_response("FORBIDDEN", "Peer is not scoped for approval execution"),
+            )
         try:
             agent = store.register_agent(
                 payload.agent_id, payload.server_name, payload.capabilities
@@ -375,6 +452,119 @@ def create_pmt_api_router(settings: TransferSettings) -> APIRouter:
         except (KeyError, PermissionError, ValueError) as exc:
             translate_error(exc)
         return success_response({"task": task})
+
+    @router.get("/approvals")
+    def list_approvals(
+        approval_status: str | None = Query(default=None, alias="status"),
+        task_ref: str | None = None,
+        limit: int = Query(default=100, ge=1, le=200),
+        _: AllowedPeer = Depends(require_agent),
+    ):
+        try:
+            approvals = store.list_approvals(status=approval_status, task_ref=task_ref, limit=limit)
+        except ValueError as exc:
+            translate_error(exc)
+        return success_response({"approvals": approvals})
+
+    @router.post("/approvals", status_code=status.HTTP_201_CREATED)
+    def create_approval_request(
+        payload: ApprovalRequestCreate,
+        peer: AllowedPeer = Depends(require_agent),
+    ):
+        try:
+            approval = store.create_approval_request(
+                action_type=payload.action_type,
+                title=payload.title,
+                reason=payload.reason,
+                payload=payload.payload,
+                requested_by=peer.name,
+                idempotency_key=payload.idempotency_key,
+                task_ref=payload.task_ref,
+                task_run_id=payload.task_run_id,
+            )
+        except (KeyError, PermissionError, ValueError) as exc:
+            translate_error(exc)
+        return success_response({"approval": approval})
+
+    @router.get("/approvals/{approval_ref}")
+    def get_approval(approval_ref: str, _: AllowedPeer = Depends(require_agent)):
+        approval = store.get_approval(approval_ref)
+        if approval is None:
+            translate_error(KeyError(approval_ref))
+        return success_response(
+            {
+                "approval": approval,
+                "events": store.approval_events(approval_ref),
+                "runs": store.list_approval_runs(approval_ref),
+            }
+        )
+
+    @router.post("/approvals/{approval_ref}/claim")
+    def claim_approval(
+        approval_ref: str,
+        payload: ApprovalClaim,
+        peer: AllowedPeer = Depends(require_agent),
+    ):
+        actor_matches(peer, payload.executor_id)
+        try:
+            approval = store.get_approval(approval_ref)
+            if approval is None:
+                raise KeyError(approval_ref)
+            require_approval_scope(peer, approval)
+            approval = store.claim_approval(
+                approval_ref,
+                payload.executor_id,
+                payload.idempotency_key,
+                payload.lease_seconds,
+            )
+        except (KeyError, PermissionError, ValueError) as exc:
+            translate_error(exc)
+        return success_response({"approval": approval})
+
+    @router.post("/approvals/{approval_ref}/heartbeat")
+    def heartbeat_approval(
+        approval_ref: str,
+        payload: ApprovalHeartbeat,
+        peer: AllowedPeer = Depends(require_agent),
+    ):
+        actor_matches(peer, payload.executor_id)
+        try:
+            approval = store.get_approval(approval_ref)
+            if approval is None:
+                raise KeyError(approval_ref)
+            require_approval_scope(peer, approval)
+            approval = store.heartbeat_approval(
+                approval_ref,
+                payload.executor_id,
+                payload.run_id,
+                payload.lease_seconds,
+            )
+        except (KeyError, PermissionError, ValueError) as exc:
+            translate_error(exc)
+        return success_response({"approval": approval})
+
+    @router.post("/approvals/{approval_ref}/finish")
+    def finish_approval(
+        approval_ref: str,
+        payload: ApprovalFinish,
+        peer: AllowedPeer = Depends(require_agent),
+    ):
+        actor_matches(peer, payload.executor_id)
+        try:
+            approval = store.get_approval(approval_ref)
+            if approval is None:
+                raise KeyError(approval_ref)
+            require_approval_scope(peer, approval)
+            approval = store.finish_approval(
+                approval_ref,
+                payload.executor_id,
+                payload.run_id,
+                payload.status,
+                payload.result,
+            )
+        except (KeyError, PermissionError, ValueError) as exc:
+            translate_error(exc)
+        return success_response({"approval": approval})
 
     @router.get("/schedules")
     def list_schedules(_: AllowedPeer = Depends(require_agent)):

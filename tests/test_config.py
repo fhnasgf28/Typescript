@@ -18,6 +18,7 @@ def test_load_settings_uses_environment_values() -> None:
         "MCP_TRANSFER_WEB_ADMIN_PASSWORD": "admin-password",
         "MCP_TRANSFER_SESSION_SECRET": "session-secret-with-more-than-32-chars",
         "MCP_TRANSFER_PUBLIC_URL": "https://server-b.clipperyt.online",
+        "MCP_TRANSFER_WEB_ADMIN_USERNAME": "Farhan",
     }
 
     settings = load_settings(env)
@@ -26,6 +27,7 @@ def test_load_settings_uses_environment_values() -> None:
     assert settings.base_dir == base_dir
     assert settings.max_file_mb == 50
     assert settings.web_admin_password == "admin-password"
+    assert settings.web_admin_username == "Farhan"
     assert settings.public_url == "https://server-b.clipperyt.online"
 
 
@@ -77,7 +79,8 @@ def test_load_destinations_reads_aliases(tmp_path: Path) -> None:
 def test_load_allowed_peers_reads_enabled_peers(tmp_path: Path) -> None:
     config_path = tmp_path / "peers.json"
     config_path.write_text(
-        '{"allowedPeers":[{"name":"server-a","tokenHash":"sha256:abc","enabled":true}]}',
+        '{"allowedPeers":[{"name":"server-a","tokenHash":"sha256:abc","enabled":true,'
+        '"scopes":["approval.execute:chat_message"]}]}',
         encoding="utf-8",
     )
 
@@ -86,3 +89,4 @@ def test_load_allowed_peers_reads_enabled_peers(tmp_path: Path) -> None:
     assert peers[0].name == "server-a"
     assert peers[0].token_hash == "sha256:abc"
     assert peers[0].enabled is True
+    assert peers[0].scopes == ("approval.execute:chat_message",)

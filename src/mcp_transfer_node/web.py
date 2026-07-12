@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import secrets
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,8 +43,14 @@ def create_web_router(settings: TransferSettings) -> APIRouter:
         return TEMPLATES.TemplateResponse(request, "login.html", {"error": ""})
 
     @router.post("/login", response_class=HTMLResponse)
-    def login(request: Request, password: str = Form(...)):
-        if not verify_web_password(password, settings.web_admin_password):
+    def login(
+        request: Request,
+        username: str = Form(...),
+        password: str = Form(...),
+    ):
+        valid_username = secrets.compare_digest(username.strip(), settings.web_admin_username)
+        valid_password = verify_web_password(password, settings.web_admin_password)
+        if not valid_username or not valid_password:
             return TEMPLATES.TemplateResponse(
                 request,
                 "login.html",
@@ -51,7 +58,10 @@ def create_web_router(settings: TransferSettings) -> APIRouter:
                 status_code=status.HTTP_401_UNAUTHORIZED,
             )
 
+        request.session.clear()
         request.session["authenticated"] = True
+        request.session["principal"] = settings.web_admin_username
+        request.session["csrf_token"] = secrets.token_urlsafe(32)
         return RedirectResponse("/pmt", status_code=status.HTTP_303_SEE_OTHER)
 
     @router.post("/logout")

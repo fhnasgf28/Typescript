@@ -8,6 +8,16 @@ import pytest
 from mcp_transfer_node.pmt_store import PmtStore, TaskInput
 
 
+def git_push_payload() -> dict[str, str]:
+    return {
+        "repository": "hmx-002",
+        "remote": "origin",
+        "source_branch": "feat/approval-center",
+        "target_branch": "Human-Resources",
+        "commit_sha": "abc1234",
+    }
+
+
 def test_create_multiple_manual_tasks_and_list_by_priority(settings):
     store = PmtStore(settings.pmt_db_path)
     store.initialize()
@@ -382,3 +392,297 @@ def test_concurrent_store_initialization_is_safe(settings):
     assert {"current_run_id", "source_branch", "pipeline_url"} <= task_columns
     assert "mode" in agent_columns
     assert "current_run_id" in schedule_columns
+
+
+def test_approval_request_is_immutable_idempotent_and_secret_safe(settings):
+    store = PmtStore(settings.pmt_db_path)
+    store.initialize()
+
+    first = store.create_approval_request(
+        action_type="git_push",
+        title="Push reviewed branch",
+        reason="Quality checks passed",
+        payload=git_push_payload(),
+        requested_by="Farhan",
+        idempotency_key="request-push-1",
+        admin_request=True,
+    )
+    repeated = store.create_approval_request(
+        action_type="git_push",
+        title="Push reviewed branch",
+        reason="Quality checks passed",
+        payload=git_push_payload(),
+        requested_by="Farhan",
+        idempotency_key="request-push-1",
+        admin_request=True,
+    )
+
+    assert first["id"] == repeated["id"]
+    assert first["status"] == "pending"
+    assert len(first["payload_sha256"]) == 64
+    with pytest.raises(PermissionError, match="cannot approve their own"):
+        store.decide_approval(first["approval_key"], "approve", "Farhan", "", 1, 3600)
+    with pytest.raises(PermissionError, match="different content"):
+        store.create_approval_request(
+            action_type="git_push",
+            title="Push another branch",
+            reason="Different intent",
+            payload={**git_push_payload(), "source_branch": "feat/other"},
+            requested_by="Farhan",
+            idempotency_key="request-push-1",
+            admin_request=True,
+        )
+    with pytest.raises(ValueError, match="unsupported fields|secrets or credentials"):
+        store.create_approval_request(
+            action_type="chat_message",
+            title="Unsafe request",
+            reason="Must be rejected",
+            payload={
+                "connector_id": "hashchat",
+                "target": "support",
+                "message": "hello",
+                "access_token": "must-not-store",
+            },
+            requested_by="Farhan",
+            idempotency_key="unsafe-request",
+            admin_request=True,
+        )
+
+
+def test_task_approval_request_requires_active_owner_and_fenced_run(settings):
+    store = PmtStore(settings.pmt_db_path)
+    store.initialize()
+    task = store.create_task(TaskInput(title="Approval-bound task"))
+    store.register_agent("agent-a", "server-a")
+    claimed = store.claim_task(task["task_key"], "agent-a", "approval-task-claim", 600)
+
+    with pytest.raises(PermissionError, match="fencing token is stale"):
+        store.create_approval_request(
+            action_type="git_push",
+            title="Push task branch",
+            reason="Ready",
+            payload=git_push_payload(),
+            requested_by="agent-a",
+            idempotency_key="task-approval-stale",
+            task_ref=task["task_key"],
+            task_run_id="stale-run",
+        )
+
+    approval = store.create_approval_request(
+        action_type="git_push",
+        title="Push task branch",
+        reason="Ready",
+        payload=git_push_payload(),
+        requested_by="agent-a",
+        idempotency_key="task-approval-valid",
+        task_ref=task["task_key"],
+        task_run_id=claimed["current_run_id"],
+    )
+    assert approval["task_id"] == task["id"]
+    assert "approval.requested" in {
+        event["event_type"] for event in store.task_events(task["task_key"])
+    }
+
+
+def test_sheet_writeback_approval_requires_stable_identity_and_allowlisted_columns(settings):
+    store = PmtStore(settings.pmt_db_path)
+    store.initialize()
+    payload = {
+        "connector_id": "bug-tracker",
+        "task_key": "PMT-0001",
+        "stable_row_key": {"column": "Task UUID", "value": "task-uuid-123"},
+        "updates": {"Dev Status": "Done dev", "Internal Status": "Done"},
+        "preconditions": {"Dev Status": "To-Do"},
+    }
+
+    approval = store.create_approval_request(
+        action_type="sheet_writeback",
+        title="Write reviewed task status",
+        reason="Task passed review",
+        payload=payload,
+        requested_by="agent-a",
+        idempotency_key="sheet-writeback-valid",
+        admin_request=True,
+    )
+
+    assert approval["payload"]["stable_row_key"]["value"] == "task-uuid-123"
+    with pytest.raises(ValueError, match="unsupported fields|row-number-only"):
+        store.create_approval_request(
+            action_type="sheet_writeback",
+            title="Unsafe row-number write",
+            reason="Must fail closed",
+            payload={**payload, "row_number": 88},
+            requested_by="agent-a",
+            idempotency_key="sheet-row-number",
+            admin_request=True,
+        )
+    with pytest.raises(ValueError, match="non-allowlisted column"):
+        store.create_approval_request(
+            action_type="sheet_writeback",
+            title="Unsafe column write",
+            reason="Must fail closed",
+            payload={**payload, "updates": {"Attachment": "https://example.test/file"}},
+            requested_by="agent-a",
+            idempotency_key="sheet-unsafe-column",
+            admin_request=True,
+        )
+
+
+def test_human_approval_and_capability_scoped_fenced_execution(settings):
+    store = PmtStore(settings.pmt_db_path)
+    store.initialize()
+    approval = store.create_approval_request(
+        action_type="git_push",
+        title="Push approved commit",
+        reason="Reviewed",
+        payload=git_push_payload(),
+        requested_by="agent-a",
+        idempotency_key="approval-flow",
+        admin_request=True,
+    )
+    approved = store.decide_approval(
+        approval["approval_key"], "approve", "Farhan", "Approved once", 1, 3600
+    )
+    assert approved["status"] == "approved"
+
+    store.register_agent("executor-a", "exec-a", ["hmx-code"])
+    with pytest.raises(PermissionError, match="lacks approval execution capability"):
+        store.claim_approval(approval["approval_key"], "executor-a", "execute-1", 600)
+    store.register_agent("executor-a", "exec-a", ["approval.execute:git_push"])
+    claimed = store.claim_approval(approval["approval_key"], "executor-a", "execute-1", 600)
+    repeated = store.claim_approval(approval["approval_key"], "executor-a", "execute-1", 600)
+
+    assert claimed["status"] == "executing"
+    assert repeated["run_id"] == claimed["run_id"]
+    assert repeated["provider_key"] == claimed["provider_key"]
+    heartbeat = store.heartbeat_approval(
+        approval["approval_key"], "executor-a", claimed["run_id"], 900
+    )
+    assert heartbeat["status"] == "executing"
+    finished = store.finish_approval(
+        approval["approval_key"],
+        "executor-a",
+        claimed["run_id"],
+        "succeeded",
+        {"external_ref": "commit:abc1234"},
+    )
+    assert finished["status"] == "succeeded"
+    assert finished["claimed_by"] is None
+    replayed_finish = store.finish_approval(
+        approval["approval_key"],
+        "executor-a",
+        claimed["run_id"],
+        "succeeded",
+        {"external_ref": "commit:abc1234"},
+    )
+    assert replayed_finish["status"] == "succeeded"
+    with pytest.raises(PermissionError, match="already finished with another result"):
+        store.finish_approval(
+            approval["approval_key"],
+            "executor-a",
+            claimed["run_id"],
+            "succeeded",
+            {},
+        )
+
+
+def test_failed_approval_execution_can_retry_with_a_new_idempotency_key(settings):
+    store = PmtStore(settings.pmt_db_path)
+    store.initialize()
+    approval = store.create_approval_request(
+        action_type="git_push",
+        title="Retry approved push",
+        reason="Transient provider failure",
+        payload=git_push_payload(),
+        requested_by="agent-a",
+        idempotency_key="retry-approval",
+        admin_request=True,
+    )
+    store.decide_approval(approval["approval_key"], "approve", "Farhan", "", 1, 3600)
+    store.register_agent("executor-a", "exec-a", ["approval.execute"])
+    first = store.claim_approval(approval["approval_key"], "executor-a", "retry-run-1", 600)
+    failed = store.finish_approval(
+        approval["approval_key"],
+        "executor-a",
+        first["run_id"],
+        "failed",
+        {"error_code": "provider_unavailable"},
+    )
+
+    assert failed["status"] == "failed"
+    retried = store.claim_approval(approval["approval_key"], "executor-a", "retry-run-2", 600)
+
+    assert retried["status"] == "executing"
+    assert retried["run_id"] != first["run_id"]
+
+
+def test_expired_approval_execution_is_reconciled_and_stale_worker_is_fenced(settings):
+    store = PmtStore(settings.pmt_db_path)
+    store.initialize()
+    approval = store.create_approval_request(
+        action_type="git_push",
+        title="Recover execution",
+        reason="Test lease recovery",
+        payload=git_push_payload(),
+        requested_by="agent-a",
+        idempotency_key="recover-approval",
+        admin_request=True,
+    )
+    store.decide_approval(approval["approval_key"], "approve", "Farhan", "", 1, 3600)
+    store.register_agent("executor-a", "exec-a", ["approval.execute"])
+    claimed = store.claim_approval(approval["approval_key"], "executor-a", "recover-run", 600)
+    with store._connect() as db:
+        db.execute(
+            "UPDATE approval_requests SET lease_expires_at=? WHERE id=?",
+            ((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), approval["id"]),
+        )
+
+    reconciled = store.reconcile_expired_approval_leases()
+    current = store.get_approval(approval["approval_key"])
+    run = store.list_approval_runs(approval["approval_key"])[0]
+
+    assert reconciled["count"] == 1
+    assert current["status"] == "approved"
+    assert current["current_run_id"] is None
+    assert run["status"] == "timed_out"
+    with pytest.raises(PermissionError, match="fencing token is stale"):
+        store.finish_approval(
+            approval["approval_key"], "executor-a", claimed["run_id"], "succeeded", {}
+        )
+    with pytest.raises(PermissionError, match="timed out"):
+        store.claim_approval(approval["approval_key"], "executor-a", "recover-run", 600)
+
+
+def test_approved_authorization_expiry_is_persisted_without_an_execution_claim(settings):
+    store = PmtStore(settings.pmt_db_path)
+    store.initialize()
+    approval = store.create_approval_request(
+        action_type="git_push",
+        title="Expire unused approval",
+        reason="No executor claimed it",
+        payload=git_push_payload(),
+        requested_by="agent-a",
+        idempotency_key="unused-expiry",
+        admin_request=True,
+    )
+    store.decide_approval(approval["approval_key"], "approve", "Farhan", "", 1, 3600)
+    with store._connect() as db:
+        db.execute(
+            "UPDATE approval_requests SET expires_at=? WHERE id=?",
+            ((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(), approval["id"]),
+        )
+
+    reconciled = store.reconcile_expired_approval_leases()
+    current = store.get_approval(approval["approval_key"])
+
+    assert reconciled["count"] == 1
+    assert current["status"] == "expired"
+    assert store.approval_events(approval["approval_key"])[0]["event_type"] == "approval.expired"
+
+
+def test_schedule_rejects_external_action_job_types(settings):
+    store = PmtStore(settings.pmt_db_path)
+    store.initialize()
+
+    with pytest.raises(ValueError, match="unsupported schedule job type"):
+        store.create_schedule("Unsafe push", "git_push", 60, {}, "agent-a")

@@ -19,6 +19,7 @@ class TransferSettings:
     public_url: str
     web_admin_password: str
     session_secret: str
+    web_admin_username: str = "admin"
 
     @property
     def inbox_dir(self) -> Path:
@@ -57,6 +58,7 @@ class AllowedPeer:
     name: str
     token_hash: str
     enabled: bool
+    scopes: tuple[str, ...] = ()
 
 
 def _env_value(env: Mapping[str, str], key: str, default: str | None = None) -> str:
@@ -113,6 +115,8 @@ def load_settings(env: Mapping[str, str] | None = None) -> TransferSettings:
         public_url=_env_value(source, "MCP_TRANSFER_PUBLIC_URL"),
         web_admin_password=_env_value(source, "MCP_TRANSFER_WEB_ADMIN_PASSWORD"),
         session_secret=_env_value(source, "MCP_TRANSFER_SESSION_SECRET"),
+        web_admin_username=source.get("MCP_TRANSFER_WEB_ADMIN_USERNAME", "admin").strip()
+        or "admin",
     )
 
 
@@ -178,6 +182,11 @@ def load_allowed_peers(config_path: Path) -> list[AllowedPeer]:
             name=str(item["name"]),
             token_hash=str(item["tokenHash"]),
             enabled=bool(item["enabled"]),
+            scopes=tuple(
+                str(scope).strip() for scope in item.get("scopes", []) if str(scope).strip()
+            )
+            if isinstance(item.get("scopes", []), list)
+            else (),
         )
         for item in _items(
             config_path,

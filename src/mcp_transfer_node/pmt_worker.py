@@ -15,16 +15,20 @@ async def run_once(worker_id: str) -> dict[str, object]:
     settings = load_settings()
     store = PmtStore(settings.pmt_db_path)
     store.initialize()
+    maintenance = {
+        "tasks": store.reconcile_expired_leases(actor=worker_id),
+        "approvals": store.reconcile_expired_approval_leases(actor=worker_id),
+    }
     schedule = store.claim_due_schedule(worker_id)
     if schedule is None:
-        return {"status": "idle", "message": "no due schedule"}
+        return {"status": "idle", "message": "no due schedule", "maintenance": maintenance}
 
     run_id = str(schedule["run_id"])
     try:
         if schedule["job_type"] == "google_sheet_sync":
             result = await sync_google_sheet(store, schedule["payload"], actor=worker_id)
         elif schedule["job_type"] == "lease_recovery":
-            result = store.reconcile_expired_leases(actor=worker_id)
+            result = maintenance
         else:
             result = {"reason": f"unsupported job type: {schedule['job_type']}"}
             store.finish_schedule_run(schedule["id"], run_id, worker_id, "skipped", result)

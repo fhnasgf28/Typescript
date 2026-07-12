@@ -41,19 +41,23 @@ def test_pmt_mcp_maps_task_detail_writes(monkeypatch):
 
     pmt_mcp_server.pmt_update_task(
         "PMT-0001",
+        "run-1",
+        2,
         project="HMX",
         module="core_hr",
         target_branch="Human-Resources",
         source_branch="feat/detail",
     )
-    pmt_mcp_server.pmt_add_acceptance_criterion("PMT-0001", "Tests pass")
-    pmt_mcp_server.pmt_add_evidence("PMT-0001", "test", label="Pre-push", note="Passed")
+    pmt_mcp_server.pmt_add_acceptance_criterion("PMT-0001", "Tests pass", "run-1", 3)
+    pmt_mcp_server.pmt_add_evidence("PMT-0001", "test", "run-1", 4, label="Pre-push", note="Passed")
 
     assert calls == [
         (
             "PATCH",
             "/tasks/PMT-0001",
             {
+                "run_id": "run-1",
+                "expected_version": 2,
                 "project": "HMX",
                 "module": "core_hr",
                 "target_branch": "Human-Resources",
@@ -64,7 +68,7 @@ def test_pmt_mcp_maps_task_detail_writes(monkeypatch):
         (
             "POST",
             "/tasks/PMT-0001/criteria",
-            {"text": "Tests pass"},
+            {"text": "Tests pass", "run_id": "run-1", "expected_version": 3},
             None,
         ),
         (
@@ -75,6 +79,8 @@ def test_pmt_mcp_maps_task_detail_writes(monkeypatch):
                 "label": "Pre-push",
                 "url": "",
                 "note": "Passed",
+                "run_id": "run-1",
+                "expected_version": 4,
             },
             None,
         ),
@@ -148,4 +154,74 @@ def test_pmt_mcp_agent_control_reads_and_heartbeats(monkeypatch):
     assert calls == [
         ("GET", "/agents", None, {"offline_after_seconds": 240}),
         ("POST", "/agents/openclaw-server-a/heartbeat", None, None),
+    ]
+
+
+def test_pmt_mcp_maps_approval_request_and_fenced_execution(monkeypatch):
+    calls = []
+
+    def fake_request(method, path, *, json_body=None, params=None):
+        calls.append((method, path, json_body, params))
+        return {"approval": {"approval_key": "APR-0001"}}
+
+    monkeypatch.setenv("MCP_PMT_AGENT_ID", "openclaw-server-a")
+    monkeypatch.setattr(pmt_mcp_server, "_request", fake_request)
+    payload = {
+        "repository": "hmx-002",
+        "remote": "origin",
+        "source_branch": "feat/approval-center",
+        "target_branch": "Human-Resources",
+        "commit_sha": "abc1234",
+    }
+
+    pmt_mcp_server.pmt_request_approval(
+        "git_push",
+        "Push reviewed branch",
+        "request-1",
+        payload,
+        reason="Checks passed",
+        task_ref="PMT-0001",
+        task_run_id="task-run-1",
+    )
+    pmt_mcp_server.pmt_claim_approved_action("APR-0001", "execute-1", 600)
+    pmt_mcp_server.pmt_finish_approved_action(
+        "APR-0001", "approval-run-1", "succeeded", {"external_ref": "commit:abc1234"}
+    )
+
+    assert calls == [
+        (
+            "POST",
+            "/approvals",
+            {
+                "action_type": "git_push",
+                "title": "Push reviewed branch",
+                "reason": "Checks passed",
+                "payload": payload,
+                "idempotency_key": "request-1",
+                "task_ref": "PMT-0001",
+                "task_run_id": "task-run-1",
+            },
+            None,
+        ),
+        (
+            "POST",
+            "/approvals/APR-0001/claim",
+            {
+                "executor_id": "openclaw-server-a",
+                "idempotency_key": "execute-1",
+                "lease_seconds": 600,
+            },
+            None,
+        ),
+        (
+            "POST",
+            "/approvals/APR-0001/finish",
+            {
+                "executor_id": "openclaw-server-a",
+                "run_id": "approval-run-1",
+                "status": "succeeded",
+                "result": {"external_ref": "commit:abc1234"},
+            },
+            None,
+        ),
     ]

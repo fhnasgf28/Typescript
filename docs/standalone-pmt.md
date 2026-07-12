@@ -6,15 +6,16 @@ Standalone PMT adds a central task-orchestration layer to MCP Transfer Node. One
 
 The MVP is deliberately small:
 
-- authenticated Web dashboard, responsive task detail, Agent Control Center, Sheet Sync Center, editing, acceptance checklist, evidence, and activity timeline
+- authenticated Web dashboard, responsive task detail, Agent Control Center, Sheet Sync Center, Approval Center, editing, acceptance checklist, evidence, and activity timeline
 - versioned agent REST API
 - remote stdio MCP adapter for each OpenClaw server
 - SQLite persistence with WAL mode
 - atomic task claim, fenced run token, bounded lease, heartbeat, idempotency, expiry reconciliation, and audit events
 - durable interval schedules with worker leases
 - a bounded Google Sheet `To-Do` importer
+- immutable approval requests, named human decisions, fenced execution attempts, idempotency, expiry recovery, and approval audit events
 
-It does **not** push branches, create merge requests, send chat messages, deploy, or write task status back to Google Sheet. Those remain explicit approval-gated follow-up integrations.
+It does **not** push branches, create merge requests, retry pipelines, send chat messages, deploy, or write task status back to Google Sheet. Sprint 2B models and gates those actions, but deliberately ships no mutating connector.
 
 ## Architecture
 
@@ -24,7 +25,8 @@ It does **not** push branches, create merge requests, send chat messages, deploy
                                     │
  OpenClaw server B ── MCP adapter ──┼── PMT FastAPI ── SQLite/WAL
                                     │       │
- Human browser ─────────────────────┘       ├── Task dashboard
+ Human browser ─────────────────────┘       ├── Task/Approval dashboards
+                                            ├── Approval execution queue
                                             └── Schedule worker
                                                    │
                                                    └── Google Sheet CSV (read only)
@@ -70,7 +72,8 @@ Example central `peers.json`:
     {
       "name": "openclaw-server-a",
       "tokenHash": "<sha256-token-hash>",
-      "enabled": true
+      "enabled": true,
+      "scopes": ["approval.execute:git_push"]
     },
     {
       "name": "openclaw-server-b",
@@ -90,9 +93,9 @@ Rules:
 - rotate a compromised peer token independently
 - put the central service behind a firewall, VPN, Cloudflare Access, or an IP allow-list
 
-The REST API prevents identity spoofing: request body `agent_id` must match `X-PMT-Agent` and the bearer-token peer name.
+The REST API prevents identity spoofing: request body `agent_id` must match `X-PMT-Agent` and the bearer-token peer name. Approval execution additionally requires both a registered active-agent capability and a configured peer scope: `approval.execute` or `approval.execute:<action_type>`. An agent cannot self-grant this authority through registration.
 
-Fine-grained scopes/RBAC and short-lived service tokens are planned hardening items. Until then, peer credentials should be granted only to trusted OpenClaw instances.
+Approval execution scopes are enforced now. Broader endpoint-level RBAC and short-lived service tokens remain planned hardening items, so peer credentials should still be granted only to trusted OpenClaw instances.
 
 ## Run the central service
 
@@ -113,6 +116,7 @@ Open:
 - Task dashboard: `http://127.0.0.1:8787/pmt`
 - Agent Control Center: `http://127.0.0.1:8787/pmt/agents`
 - Read-only Sheet Sync Center: `http://127.0.0.1:8787/pmt/sync`
+- Approval Center: `http://127.0.0.1:8787/pmt/approvals`
 - REST API prefix: `/api/v1/pmt`
 - Existing transfer functions remain available.
 
@@ -198,7 +202,16 @@ Schedule writes:
 - `pmt_claim_due_schedule`
 - `pmt_finish_schedule`
 
-The MCP context pack marks push, MR creation, external status writes, messaging, and deployment as approval gates.
+Approval workflow:
+
+- `pmt_request_approval`
+- `pmt_get_approvals`
+- `pmt_get_approval`
+- `pmt_claim_approved_action`
+- `pmt_approval_heartbeat`
+- `pmt_finish_approved_action`
+
+Task-detail mutations require both the active `run_id` fencing token and the caller-observed `expected_version`. The MCP context pack includes durable approval records instead of informational booleans.
 
 ## REST API examples
 
@@ -252,9 +265,66 @@ curl --fail-with-body https://pmt.example.com/api/v1/pmt/tasks/PMT-0001/heartbea
   -d '{"agent_id":"openclaw-server-a","run_id":"<current_run_id-from-claim>","lease_seconds":1800}'
 ```
 
+## Approval Center
+
+External actions use a queue that is separate from schedules:
+
+```text
+pending -> approved -> executing -> succeeded
+   |          |            |
+   +-> rejected/cancelled   +-> failed -> executing (new attempt)
+              approved/executing -> expired
+```
+
+Safety invariants:
+
+- the request stores a canonical immutable payload and `payload_sha256`
+- typed payload schemas reject unexpected fields, secret-like keys, non-finite JSON, excessive nesting, and oversized data
+- task-linked agent requests require the active task owner and its fenced `task_run_id`
+- request creation is idempotent; reusing the key with different content is rejected
+- the requester cannot approve their own request
+- browser decisions require a named session principal, CSRF token, caller-observed approval version, and exact typed approval key
+- approval has a bounded validity period after the human decision
+- execution requires an enabled scoped peer plus a registered active agent capability
+- execution claim creates a distinct run ID, lease, heartbeat, deterministic provider key, and audit event
+- finish is fenced and safely replayable only with the same final status and canonical result
+- failed attempts may retry with a new execution idempotency key while approval is valid
+- timed-out attempts are closed and cannot reuse their old idempotency key
+- approval, execution-run, and task-linked events are retained in SQLite
+
+Supported request action types are `sheet_writeback`, `git_push`, `gitlab_merge_request`, `gitlab_pipeline_retry`, `chat_message`, and `deployment`. They are authorization envelopes, not connector implementations. The central worker only reconciles leases; it does not execute an external action.
+
+Example agent request:
+
+```json
+{
+  "action_type": "git_push",
+  "title": "Push reviewed HMX branch",
+  "reason": "Fresh-DB tests and pre-push quality passed",
+  "idempotency_key": "PMT-0001-git-push-abc1234",
+  "task_ref": "PMT-0001",
+  "task_run_id": "<active-task-run-id>",
+  "payload": {
+    "repository": "hmx-002",
+    "remote": "origin",
+    "source_branch": "feat/example",
+    "target_branch": "Human-Resources",
+    "commit_sha": "abc1234"
+  }
+}
+```
+
+The human reviews the exact payload at `/pmt/approvals`, types the displayed `APR-xxxx` key, and approves or rejects it. Approval does not itself perform the action.
+
+### Threat model and explicit non-goals
+
+The design addresses duplicate agents, stale task owners, concurrent human decisions, stale executors, request replay, accidental payload changes, CSRF on approval decisions, self-approved requests, self-granted execution capability, secret material in approval JSON, and schedule-based bypass of the approval queue.
+
+The current release does not claim to protect against a compromised PMT host/database administrator, a stolen human password/session, a stolen already-scoped peer token, or a malicious external provider. It does not provide OIDC, multi-role project authorization, cryptographic append-only audit storage, credential brokerage, connector-side rollback, or exactly-once guarantees from external providers. Executors must use `provider_key` as the provider-side idempotency key when a future connector supports one.
+
 ## Google Sheet schedule
 
-Executable job types are `google_sheet_sync` and `lease_recovery`. Sheet sync accepts a public Google Sheet CSV export URL and imports matching rows as idempotent PMT tasks. Lease recovery releases expired task claims and closes their fenced runs.
+Executable job types are `google_sheet_sync` and `lease_recovery`. Sheet sync accepts a public Google Sheet CSV export URL and imports matching rows as idempotent PMT tasks. Every worker invocation reconciles expired task and approval-execution leases before claiming a schedule, so recovery does not depend on an optional schedule record; the explicit `lease_recovery` type remains available for observability/backward compatibility.
 
 Default filters follow the current HMX workflow:
 
@@ -306,25 +376,28 @@ Use one system cron or timer on the **central PMT server** to invoke the worker 
 7. update progress/blocker
 8. run module, pre-push, access, pipeline, and UI evidence checks as required
 9. `pmt_submit_for_review`
-10. wait for explicit approval before push, MR creation, external Sheet update, chat send, or deployment
+10. create a typed approval request with `pmt_request_approval`
+11. wait for a different named human to approve the immutable payload in Approval Center
+12. only a separately scoped executor may claim the approved request; no external connector is enabled in this release
 
 ## Known MVP limitations
 
 - SQLite is appropriate for one central PMT process and moderate agent traffic. Move to PostgreSQL before horizontal API scaling.
-- Web login is a single admin password inherited from Transfer Node; use OIDC and RBAC before multi-user/public deployment.
-- Peer identities do not yet have fine-grained scopes.
+- Web login uses one configured named admin principal and password; use OIDC, multiple human identities, and RBAC before multi-user/public deployment.
+- Peer scope enforcement currently protects approval execution only; broader endpoint-level scopes remain future work.
 - Schedules are interval-based, not full cron expressions.
 - Sheet identity includes spreadsheet ID, gid, and row number. A stable source UUID column is still recommended before rows are frequently reordered.
-- No attachment upload, webhook receiver, GitLab write, Sheet write-back, notification send, or deployment action is implemented.
-- Approval requests, task dependencies, evidence verdict automation, and sprint analytics remain follow-up modules.
+- No attachment upload, webhook receiver, GitLab write, Sheet write-back, notification send, pipeline retry, or deployment action is implemented.
+- Stable Sheet source-row UUIDs are required before enabling controlled write-back; row-number identity is insufficient.
+- Task dependencies, evidence verdict automation, and sprint analytics remain follow-up modules.
 
 ## Next hardening milestones
 
 1. PostgreSQL migrations and `SELECT ... FOR UPDATE SKIP LOCKED`
-2. OIDC login, project RBAC, and per-agent scopes
+2. OIDC login, project RBAC, and endpoint-level per-agent scopes
 3. stable Sheet source IDs and conflict-aware two-way sync
-4. approval-request records for push/MR/message/deploy
-5. structured evidence and required-check verdicts
-6. GitLab read-only pipeline/MR connector
-7. audit export, metrics, backups, and retention policy
-8. webhook signatures, rate limits, and reverse-proxy security headers
+4. dry-run connector previews and credential brokerage outside approval payloads
+5. controlled Sheet/GitLab/chat executors with provider idempotency and explicit enable switches
+6. structured evidence and required-check verdicts
+7. GitLab read-only pipeline/MR connector
+8. audit export, metrics, backups, retention, webhook signatures, and rate limits

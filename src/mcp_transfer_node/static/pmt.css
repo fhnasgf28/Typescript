@@ -315,6 +315,27 @@ body.pmt-body {
 .pmt-status-offline { color: #475569; background: #e2e8f0; }
 .pmt-status-disabled { color: #b91c1c; background: #fee2e2; }
 
+.pmt-approval-pending { color: #92400e; background: #fef3c7; }
+.pmt-approval-approved { color: #065f46; background: #d1fae5; }
+.pmt-approval-executing { color: #3730a3; background: #e0e7ff; }
+.pmt-approval-succeeded { color: #047857; background: #d1fae5; }
+.pmt-approval-failed,
+.pmt-approval-rejected { color: #b91c1c; background: #fee2e2; }
+.pmt-approval-cancelled,
+.pmt-approval-expired { color: #475569; background: #e2e8f0; }
+
+.pmt-code-block {
+  max-height: 24rem;
+  padding: 1rem;
+  overflow: auto;
+  color: #dbeafe;
+  font-size: 0.78rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: #111827;
+  border-radius: 0.9rem;
+}
+
 .pmt-responsive-table { overflow-x: auto; }
 .pmt-responsive-table .table { min-width: 42rem; }
 

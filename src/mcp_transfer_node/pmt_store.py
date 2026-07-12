@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -23,6 +24,35 @@ TASK_STATUSES = {
 TASK_PRIORITIES = {"low", "normal", "high", "urgent"}
 EVIDENCE_TYPES = {"commit", "merge_request", "pipeline", "screenshot", "video", "test", "note"}
 AGENT_MODES = {"active", "draining", "disabled"}
+SCHEDULE_JOB_TYPES = {"google_sheet_sync", "lease_recovery"}
+APPROVAL_ACTION_TYPES = {
+    "sheet_writeback",
+    "git_push",
+    "gitlab_merge_request",
+    "gitlab_pipeline_retry",
+    "chat_message",
+    "deployment",
+}
+APPROVAL_STATUSES = {
+    "pending",
+    "approved",
+    "executing",
+    "succeeded",
+    "failed",
+    "rejected",
+    "cancelled",
+    "expired",
+}
+SENSITIVE_PAYLOAD_KEYS = {
+    "authorization",
+    "cookie",
+    "credential",
+    "credentials",
+    "password",
+    "private_key",
+    "secret",
+    "token",
+}
 AGENT_STATUS_TRANSITIONS = {
     "claimed": {"in_progress", "blocked", "todo"},
     "in_progress": {"in_progress", "blocked", "ready_for_review", "todo"},
@@ -197,6 +227,60 @@ class PmtStore:
                     ON schedule_runs(schedule_id, started_at);
                 CREATE INDEX IF NOT EXISTS idx_schedules_due
                     ON schedules(enabled, next_run_at);
+                CREATE TABLE IF NOT EXISTS approval_requests (
+                    id TEXT PRIMARY KEY,
+                    approval_key TEXT NOT NULL UNIQUE,
+                    task_id TEXT REFERENCES tasks(id),
+                    action_type TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    reason TEXT NOT NULL DEFAULT '',
+                    payload TEXT NOT NULL DEFAULT '{}',
+                    payload_sha256 TEXT NOT NULL,
+                    requested_by TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    version INTEGER NOT NULL DEFAULT 1,
+                    decided_by TEXT,
+                    decision_note TEXT NOT NULL DEFAULT '',
+                    decided_at TEXT,
+                    expires_at TEXT,
+                    claimed_by TEXT,
+                    lease_expires_at TEXT,
+                    current_run_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_approval_request_idempotency
+                    ON approval_requests(requested_by,idempotency_key)
+                    WHERE idempotency_key != '';
+                CREATE INDEX IF NOT EXISTS idx_approval_status_created
+                    ON approval_requests(status,created_at);
+                CREATE INDEX IF NOT EXISTS idx_approval_task
+                    ON approval_requests(task_id,created_at);
+                CREATE TABLE IF NOT EXISTS approval_runs (
+                    id TEXT PRIMARY KEY,
+                    approval_id TEXT NOT NULL REFERENCES approval_requests(id),
+                    executor_id TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    provider_key TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    heartbeat_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    result TEXT NOT NULL DEFAULT '{}'
+                );
+                CREATE INDEX IF NOT EXISTS idx_approval_runs_request
+                    ON approval_runs(approval_id,started_at);
+                CREATE TABLE IF NOT EXISTS approval_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    approval_id TEXT NOT NULL REFERENCES approval_requests(id),
+                    event_type TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    payload TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_approval_events_request
+                    ON approval_events(approval_id,id);
                 """
             )
             db.execute("BEGIN IMMEDIATE")
@@ -208,6 +292,7 @@ class PmtStore:
                 self._ensure_column(db, "tasks", "current_run_id", "TEXT")
                 self._ensure_column(db, "agents", "mode", "TEXT NOT NULL DEFAULT 'active'")
                 self._ensure_column(db, "schedules", "current_run_id", "TEXT")
+                self._ensure_column(db, "approval_runs", "provider_key", "TEXT NOT NULL DEFAULT ''")
                 self._migrate_active_task_runs(db)
             except Exception:
                 db.rollback()
@@ -324,12 +409,18 @@ class PmtStore:
         return url
 
     @staticmethod
-    def _require_active_owner(row: sqlite3.Row, expected_owner: str | None) -> None:
+    def _require_active_owner(
+        row: sqlite3.Row,
+        expected_owner: str | None,
+        expected_run_id: str | None = None,
+    ) -> None:
         if expected_owner is None:
             return
         lease = row["lease_expires_at"]
         if row["claimed_by"] != expected_owner:
             raise PermissionError("task detail writes require the active task owner")
+        if not expected_run_id or row["current_run_id"] != expected_run_id:
+            raise PermissionError("task run fencing token is stale")
         if not lease or datetime.fromisoformat(lease) <= utcnow():
             raise LeaseExpiredError("task lease expired; reclaim before continuing")
 
@@ -339,6 +430,120 @@ class PmtStore:
         result["payload"] = json.loads(result["payload"])
         result["enabled"] = bool(result["enabled"])
         return result
+
+    @staticmethod
+    def _approval(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        result["payload"] = json.loads(result["payload"])
+        return result
+
+    @staticmethod
+    def _safe_json_object(value: dict[str, Any], field_name: str = "payload") -> tuple[str, str]:
+        def inspect(item: Any, depth: int = 0) -> None:
+            if depth > 8:
+                raise ValueError(f"{field_name} nesting is too deep")
+            if isinstance(item, dict):
+                if len(item) > 100:
+                    raise ValueError(f"{field_name} contains too many fields")
+                for key, nested in item.items():
+                    normalized = str(key).strip().lower().replace("-", "_")
+                    if any(marker in normalized for marker in SENSITIVE_PAYLOAD_KEYS):
+                        raise ValueError(f"{field_name} must not contain secrets or credentials")
+                    inspect(nested, depth + 1)
+            elif isinstance(item, list):
+                if len(item) > 200:
+                    raise ValueError(f"{field_name} contains too many items")
+                for nested in item:
+                    inspect(nested, depth + 1)
+            elif item is not None and not isinstance(item, (str, int, float, bool)):
+                raise ValueError(f"{field_name} must be JSON-compatible")
+
+        if not isinstance(value, dict):
+            raise ValueError(f"{field_name} must be an object")
+        inspect(value)
+        try:
+            encoded = json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field_name} must be valid JSON") from exc
+        if len(encoded.encode("utf-8")) > 20_000:
+            raise ValueError(f"{field_name} exceeds 20 KB")
+        return encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _validate_approval_payload(action_type: str, payload: dict[str, Any]) -> None:
+        schemas: dict[str, tuple[set[str], set[str]]] = {
+            "sheet_writeback": (
+                {"connector_id", "task_key", "stable_row_key", "updates", "preconditions"},
+                {"connector_id", "task_key", "stable_row_key", "updates", "preconditions"},
+            ),
+            "git_push": (
+                {"repository", "remote", "source_branch", "target_branch", "commit_sha"},
+                {"repository", "remote", "source_branch", "target_branch", "commit_sha"},
+            ),
+            "gitlab_merge_request": (
+                {"project_path", "source_branch", "target_branch", "title", "description"},
+                {"project_path", "source_branch", "target_branch", "title", "description"},
+            ),
+            "gitlab_pipeline_retry": (
+                {"project_path", "pipeline_id"},
+                {"project_path", "pipeline_id", "job_id"},
+            ),
+            "chat_message": (
+                {"connector_id", "target", "message"},
+                {"connector_id", "target", "message", "thread_id"},
+            ),
+            "deployment": (
+                {"environment", "artifact_ref", "version"},
+                {"environment", "artifact_ref", "version", "notes"},
+            ),
+        }
+        required, allowed = schemas[action_type]
+        keys = set(payload)
+        missing = sorted(required - keys)
+        unexpected = sorted(keys - allowed)
+        if missing:
+            raise ValueError(f"approval payload missing fields: {', '.join(missing)}")
+        if unexpected:
+            raise ValueError(
+                f"approval payload contains unsupported fields: {', '.join(unexpected)}"
+            )
+        if action_type == "sheet_writeback":
+            stable_key = payload["stable_row_key"]
+            if not isinstance(stable_key, dict) or set(stable_key) != {"column", "value"}:
+                raise ValueError("sheet write-back requires a stable row key column and value")
+            if not all(str(stable_key[item]).strip() for item in ("column", "value")):
+                raise ValueError("sheet stable row key cannot be blank")
+            updates = payload["updates"]
+            preconditions = payload["preconditions"]
+            writable_columns = {
+                "Dev Status",
+                "Internal Status",
+                "Internal Status Date",
+                "Internal Status Note",
+            }
+            if not isinstance(updates, dict) or not updates:
+                raise ValueError("sheet write-back requires at least one update")
+            if not isinstance(preconditions, dict) or not preconditions:
+                raise ValueError("sheet write-back requires preconditions")
+            if not set(updates) <= writable_columns or not set(preconditions) <= writable_columns:
+                raise ValueError("sheet write-back contains a non-allowlisted column")
+            if "row" in payload or "row_number" in payload:
+                raise ValueError("row-number-only Sheet write-back is forbidden")
+        for key, value in payload.items():
+            if key in {"pipeline_id", "job_id"}:
+                if not isinstance(value, int) or value < 1:
+                    raise ValueError(f"{key} must be a positive integer")
+            elif key not in {"stable_row_key", "updates", "preconditions"}:
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(f"approval payload field {key} must be a non-empty string")
+                if len(value) > 20_000:
+                    raise ValueError(f"approval payload field {key} exceeds allowed length")
 
     def _event(
         self,
@@ -366,10 +571,28 @@ class PmtStore:
             (agent_id, event_type, actor, json.dumps(payload or {}), iso()),
         )
 
+    def _approval_event(
+        self,
+        db: sqlite3.Connection,
+        approval_id: str,
+        event_type: str,
+        actor: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        db.execute(
+            "INSERT INTO approval_events(approval_id,event_type,actor,payload,created_at) VALUES(?,?,?,?,?)",
+            (approval_id, event_type, actor, json.dumps(payload or {}), iso()),
+        )
+
     def _next_key(self, db: sqlite3.Connection, prefix: str = "PMT") -> str:
-        db.execute("INSERT INTO counters(name,value) VALUES('task',0) ON CONFLICT(name) DO NOTHING")
+        counter_name = "task" if prefix == "PMT" else prefix.lower()
+        db.execute(
+            "INSERT INTO counters(name,value) VALUES(?,0) ON CONFLICT(name) DO NOTHING",
+            (counter_name,),
+        )
         row = db.execute(
-            "UPDATE counters SET value=value+1 WHERE name='task' RETURNING value"
+            "UPDATE counters SET value=value+1 WHERE name=? RETURNING value",
+            (counter_name,),
         ).fetchone()
         return f"{prefix}-{int(row['value']):04d}"
 
@@ -523,6 +746,7 @@ class PmtStore:
         mr_url: str = "",
         pipeline_url: str = "",
         expected_owner: str | None = None,
+        expected_run_id: str | None = None,
         expected_version: int | None = None,
     ) -> dict[str, Any]:
         if not title.strip():
@@ -537,7 +761,7 @@ class PmtStore:
             ).fetchone()
             if row is None:
                 raise KeyError(task_ref)
-            self._require_active_owner(row, expected_owner)
+            self._require_active_owner(row, expected_owner, expected_run_id)
             if expected_version is not None and row["version"] != expected_version:
                 raise PermissionError("task changed since it was loaded; refresh and retry")
             values = {
@@ -572,7 +796,13 @@ class PmtStore:
             return self._task(updated)
 
     def add_acceptance_criterion(
-        self, task_ref: str, text: str, actor: str, expected_owner: str | None = None
+        self,
+        task_ref: str,
+        text: str,
+        actor: str,
+        expected_owner: str | None = None,
+        expected_run_id: str | None = None,
+        expected_version: int | None = None,
     ) -> dict[str, Any]:
         if not text.strip():
             raise ValueError("criterion text is required")
@@ -582,7 +812,9 @@ class PmtStore:
             ).fetchone()
             if row is None:
                 raise KeyError(task_ref)
-            self._require_active_owner(row, expected_owner)
+            self._require_active_owner(row, expected_owner, expected_run_id)
+            if expected_version is not None and row["version"] != expected_version:
+                raise PermissionError("task changed since it was loaded; refresh and retry")
             criteria = self._criteria(json.loads(row["acceptance_criteria"]))
             criterion = {
                 "id": f"criterion_{uuid.uuid4().hex}",
@@ -605,6 +837,8 @@ class PmtStore:
         criterion_id: str,
         actor: str,
         expected_owner: str | None = None,
+        expected_run_id: str | None = None,
+        expected_version: int | None = None,
     ) -> dict[str, Any]:
         with self._transaction() as db:
             row = db.execute(
@@ -612,7 +846,9 @@ class PmtStore:
             ).fetchone()
             if row is None:
                 raise KeyError(task_ref)
-            self._require_active_owner(row, expected_owner)
+            self._require_active_owner(row, expected_owner, expected_run_id)
+            if expected_version is not None and row["version"] != expected_version:
+                raise PermissionError("task changed since it was loaded; refresh and retry")
             criteria = self._criteria(json.loads(row["acceptance_criteria"]))
             criterion = next((item for item in criteria if item["id"] == criterion_id), None)
             if criterion is None:
@@ -628,7 +864,12 @@ class PmtStore:
             return self._task(updated)
 
     def admin_transition_task(
-        self, task_ref: str, target_status: str, actor: str, note: str = ""
+        self,
+        task_ref: str,
+        target_status: str,
+        actor: str,
+        note: str = "",
+        expected_version: int | None = None,
     ) -> dict[str, Any]:
         if target_status not in TASK_STATUSES:
             raise ValueError(f"invalid status: {target_status}")
@@ -638,6 +879,8 @@ class PmtStore:
             ).fetchone()
             if row is None:
                 raise KeyError(task_ref)
+            if expected_version is not None and row["version"] != expected_version:
+                raise PermissionError("task changed since it was loaded; refresh and retry")
             if target_status == row["status"]:
                 return self._task(row)
             allowed = ADMIN_STATUS_TRANSITIONS.get(row["status"], set())
@@ -700,6 +943,8 @@ class PmtStore:
         note: str,
         actor: str,
         expected_owner: str | None = None,
+        expected_run_id: str | None = None,
+        expected_version: int | None = None,
     ) -> dict[str, Any]:
         if evidence_type not in EVIDENCE_TYPES:
             raise ValueError(f"invalid evidence type: {evidence_type}")
@@ -712,7 +957,9 @@ class PmtStore:
             ).fetchone()
             if row is None:
                 raise KeyError(task_ref)
-            self._require_active_owner(row, expected_owner)
+            self._require_active_owner(row, expected_owner, expected_run_id)
+            if expected_version is not None and row["version"] != expected_version:
+                raise PermissionError("task changed since it was loaded; refresh and retry")
             evidence_id = f"evidence_{uuid.uuid4().hex}"
             created_at = iso()
             db.execute(
@@ -729,6 +976,10 @@ class PmtStore:
                     actor,
                     created_at,
                 ),
+            )
+            db.execute(
+                "UPDATE tasks SET version=version+1,updated_at=? WHERE id=?",
+                (created_at, row["id"]),
             )
             payload = {
                 "id": evidence_id,
@@ -1026,7 +1277,7 @@ class PmtStore:
                 raise PermissionError("agent does not own this task")
             if not run_id or row["current_run_id"] != run_id:
                 raise PermissionError("task run fencing token is stale")
-            self._require_active_owner(row, agent_id)
+            self._require_active_owner(row, agent_id, run_id)
             db.execute(
                 "UPDATE tasks SET lease_expires_at=?,updated_at=? WHERE id=?",
                 (expires.isoformat(), now.isoformat(), row["id"]),
@@ -1072,7 +1323,7 @@ class PmtStore:
                 raise PermissionError("agent does not own this task")
             if not run_id or row["current_run_id"] != run_id:
                 raise PermissionError("task run fencing token is stale")
-            self._require_active_owner(row, agent_id)
+            self._require_active_owner(row, agent_id, run_id)
             allowed = AGENT_STATUS_TRANSITIONS.get(row["status"], set())
             if target_status not in allowed:
                 raise ValueError(f"invalid agent transition: {row['status']} -> {target_status}")
@@ -1152,6 +1403,532 @@ class PmtStore:
                 released.append({"task_key": row["task_key"], "agent_id": agent_id})
         return {"released": released, "count": len(released), "checked_at": now.isoformat()}
 
+    def create_approval_request(
+        self,
+        *,
+        action_type: str,
+        title: str,
+        reason: str,
+        payload: dict[str, Any],
+        requested_by: str,
+        idempotency_key: str,
+        task_ref: str | None = None,
+        task_run_id: str | None = None,
+        admin_request: bool = False,
+    ) -> dict[str, Any]:
+        action_type = action_type.strip()
+        title = title.strip()
+        reason = reason.strip()
+        requested_by = requested_by.strip()
+        idempotency_key = idempotency_key.strip()
+        if action_type not in APPROVAL_ACTION_TYPES:
+            raise ValueError("unsupported approval action type")
+        if not title or not requested_by or not idempotency_key:
+            raise ValueError("title, requested_by, and idempotency_key are required")
+        if len(title) > 300 or len(reason) > 20_000 or len(idempotency_key) > 240:
+            raise ValueError("approval request fields exceed allowed length")
+        self._validate_approval_payload(action_type, payload)
+        encoded_payload, payload_sha256 = self._safe_json_object(payload)
+        now = iso()
+        with self._transaction() as db:
+            task = None
+            if task_ref:
+                task = db.execute(
+                    "SELECT * FROM tasks WHERE id=? OR task_key=?", (task_ref, task_ref)
+                ).fetchone()
+                if task is None:
+                    raise KeyError(task_ref)
+                if not admin_request:
+                    self._require_active_owner(task, requested_by, task_run_id)
+
+            prior = db.execute(
+                "SELECT * FROM approval_requests WHERE requested_by=? AND idempotency_key=?",
+                (requested_by, idempotency_key),
+            ).fetchone()
+            if prior is not None:
+                if (
+                    prior["action_type"] != action_type
+                    or prior["payload_sha256"] != payload_sha256
+                    or prior["title"] != title
+                    or prior["reason"] != reason
+                    or prior["task_id"] != (task["id"] if task is not None else None)
+                ):
+                    raise PermissionError(
+                        "approval idempotency key was reused with different content"
+                    )
+                return self._approval(prior)
+
+            approval_id = f"approval_{uuid.uuid4().hex}"
+            approval_key = self._next_key(db, "APR")
+            db.execute(
+                """INSERT INTO approval_requests(
+                    id,approval_key,task_id,action_type,title,reason,payload,payload_sha256,
+                    requested_by,idempotency_key,status,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    approval_id,
+                    approval_key,
+                    task["id"] if task is not None else None,
+                    action_type,
+                    title,
+                    reason,
+                    encoded_payload,
+                    payload_sha256,
+                    requested_by,
+                    idempotency_key,
+                    "pending",
+                    now,
+                    now,
+                ),
+            )
+            event_payload = {
+                "approval_key": approval_key,
+                "action_type": action_type,
+                "payload_sha256": payload_sha256,
+            }
+            self._approval_event(db, approval_id, "approval.requested", requested_by, event_payload)
+            if task is not None:
+                self._event(db, task["id"], "approval.requested", requested_by, event_payload)
+            row = db.execute(
+                "SELECT * FROM approval_requests WHERE id=?", (approval_id,)
+            ).fetchone()
+            return self._approval(row)
+
+    def list_approvals(
+        self,
+        *,
+        status: str | None = None,
+        task_ref: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        if status is not None and status not in APPROVAL_STATUSES:
+            raise ValueError("invalid approval status")
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status:
+            clauses.append("approval_requests.status=?")
+            params.append(status)
+        if task_ref:
+            clauses.append("(tasks.id=? OR tasks.task_key=?)")
+            params.extend([task_ref, task_ref])
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        params.append(max(1, min(limit, 200)))
+        with self._connect() as db:
+            rows = db.execute(
+                f"""SELECT approval_requests.*,tasks.task_key
+                    FROM approval_requests LEFT JOIN tasks ON tasks.id=approval_requests.task_id
+                    {where} ORDER BY approval_requests.created_at DESC LIMIT ?""",
+                params,
+            ).fetchall()
+        return [self._approval(row) for row in rows]
+
+    def get_approval(self, approval_ref: str) -> dict[str, Any] | None:
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT approval_requests.*,tasks.task_key
+                    FROM approval_requests LEFT JOIN tasks ON tasks.id=approval_requests.task_id
+                    WHERE approval_requests.id=? OR approval_requests.approval_key=?""",
+                (approval_ref, approval_ref),
+            ).fetchone()
+        return self._approval(row) if row is not None else None
+
+    def approval_events(self, approval_ref: str, limit: int = 100) -> list[dict[str, Any]]:
+        approval = self.get_approval(approval_ref)
+        if approval is None:
+            raise KeyError(approval_ref)
+        with self._connect() as db:
+            rows = db.execute(
+                """SELECT * FROM approval_events WHERE approval_id=?
+                    ORDER BY id DESC LIMIT ?""",
+                (approval["id"], max(1, min(limit, 200))),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["payload"] = json.loads(item["payload"])
+            result.append(item)
+        return result
+
+    def decide_approval(
+        self,
+        approval_ref: str,
+        decision: str,
+        actor: str,
+        note: str,
+        expected_version: int,
+        approval_ttl_seconds: int = 3600,
+    ) -> dict[str, Any]:
+        decision = decision.strip()
+        actor = actor.strip()
+        note = note.strip()
+        transitions = {
+            "approve": ({"pending", "failed", "expired"}, "approved"),
+            "reject": ({"pending", "approved"}, "rejected"),
+            "cancel": ({"pending", "approved"}, "cancelled"),
+        }
+        if decision not in transitions:
+            raise ValueError("invalid approval decision")
+        if not actor:
+            raise ValueError("decision actor is required")
+        if len(note) > 20_000:
+            raise ValueError("decision note exceeds allowed length")
+        allowed_from, target = transitions[decision]
+        now = utcnow()
+        ttl = max(300, min(approval_ttl_seconds, 24 * 3600))
+        with self._transaction() as db:
+            row = db.execute(
+                "SELECT * FROM approval_requests WHERE id=? OR approval_key=?",
+                (approval_ref, approval_ref),
+            ).fetchone()
+            if row is None:
+                raise KeyError(approval_ref)
+            if row["version"] != expected_version:
+                raise PermissionError("approval changed since it was loaded")
+            if decision == "approve" and actor == row["requested_by"]:
+                raise PermissionError("approval requester cannot approve their own request")
+            if row["status"] not in allowed_from:
+                raise ValueError(f"cannot {decision} approval from {row['status']}")
+            expires_at = (
+                (now + timedelta(seconds=ttl)).isoformat() if target == "approved" else None
+            )
+            cursor = db.execute(
+                """UPDATE approval_requests SET status=?,version=version+1,decided_by=?,
+                    decision_note=?,decided_at=?,expires_at=?,claimed_by=NULL,
+                    lease_expires_at=NULL,current_run_id=NULL,updated_at=?
+                    WHERE id=? AND version=?""",
+                (
+                    target,
+                    actor,
+                    note,
+                    now.isoformat(),
+                    expires_at,
+                    now.isoformat(),
+                    row["id"],
+                    expected_version,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise PermissionError("approval changed since it was loaded")
+            event_payload = {"from": row["status"], "to": target, "note": note}
+            self._approval_event(db, row["id"], f"approval.{target}", actor, event_payload)
+            if row["task_id"]:
+                self._event(db, row["task_id"], f"approval.{target}", actor, event_payload)
+            updated = db.execute(
+                "SELECT * FROM approval_requests WHERE id=?", (row["id"],)
+            ).fetchone()
+            return self._approval(updated)
+
+    def claim_approval(
+        self,
+        approval_ref: str,
+        executor_id: str,
+        idempotency_key: str,
+        lease_seconds: int = 900,
+    ) -> dict[str, Any]:
+        executor_id = executor_id.strip()
+        idempotency_key = idempotency_key.strip()
+        if not executor_id or not idempotency_key:
+            raise ValueError("executor_id and idempotency_key are required")
+        if len(idempotency_key) > 240:
+            raise ValueError("idempotency_key exceeds allowed length")
+        now = utcnow()
+        lease_seconds = max(60, min(lease_seconds, 3600))
+        expired = False
+        result: dict[str, Any] | None = None
+        with self._transaction() as db:
+            row = db.execute(
+                "SELECT * FROM approval_requests WHERE id=? OR approval_key=?",
+                (approval_ref, approval_ref),
+            ).fetchone()
+            if row is None:
+                raise KeyError(approval_ref)
+            prior_run = db.execute(
+                "SELECT * FROM approval_runs WHERE idempotency_key=?", (idempotency_key,)
+            ).fetchone()
+            if prior_run is not None:
+                if prior_run["approval_id"] != row["id"] or prior_run["executor_id"] != executor_id:
+                    raise PermissionError("approval execution idempotency key is already in use")
+                if prior_run["status"] == "timed_out":
+                    raise PermissionError(
+                        "approval execution attempt timed out; use a new idempotency key"
+                    )
+                result = self._approval(row)
+                result["run_id"] = prior_run["id"]
+                result["provider_key"] = prior_run["provider_key"]
+                return result
+
+            agent = db.execute("SELECT * FROM agents WHERE agent_id=?", (executor_id,)).fetchone()
+            if agent is None:
+                raise PermissionError("executor must register before claiming an approval")
+            if agent["mode"] != "active":
+                raise PermissionError(f"executor is {agent['mode']} and cannot claim approvals")
+            capabilities = set(json.loads(agent["capabilities"]))
+            if not (
+                "approval.execute" in capabilities
+                or f"approval.execute:{row['action_type']}" in capabilities
+            ):
+                raise PermissionError("executor lacks approval execution capability")
+            if row["status"] not in {"approved", "failed"}:
+                raise PermissionError(f"approval is {row['status']} and cannot be executed")
+            if not row["expires_at"] or datetime.fromisoformat(row["expires_at"]) <= now:
+                db.execute(
+                    """UPDATE approval_requests SET status='expired',version=version+1,
+                        updated_at=? WHERE id=? AND status IN ('approved','failed')""",
+                    (now.isoformat(), row["id"]),
+                )
+                self._approval_event(
+                    db, row["id"], "approval.expired", "approval-lease-monitor", {}
+                )
+                expired = True
+            else:
+                run_id = f"approval_run_{uuid.uuid4().hex}"
+                provider_key = hashlib.sha256(
+                    f"{row['id']}:{row['action_type']}:{row['payload_sha256']}".encode()
+                ).hexdigest()
+                lease_expires_at = (now + timedelta(seconds=lease_seconds)).isoformat()
+                cursor = db.execute(
+                    """UPDATE approval_requests SET status='executing',claimed_by=?,
+                        lease_expires_at=?,current_run_id=?,version=version+1,updated_at=?
+                        WHERE id=? AND status IN ('approved','failed')""",
+                    (executor_id, lease_expires_at, run_id, now.isoformat(), row["id"]),
+                )
+                if cursor.rowcount != 1:
+                    raise PermissionError("approval was claimed concurrently")
+                db.execute(
+                    """INSERT INTO approval_runs(
+                        id,approval_id,executor_id,idempotency_key,provider_key,status,
+                        started_at,heartbeat_at
+                    ) VALUES(?,?,?,?,?,?,?,?)""",
+                    (
+                        run_id,
+                        row["id"],
+                        executor_id,
+                        idempotency_key,
+                        provider_key,
+                        "running",
+                        now.isoformat(),
+                        now.isoformat(),
+                    ),
+                )
+                self._approval_event(
+                    db,
+                    row["id"],
+                    "approval.execution_claimed",
+                    executor_id,
+                    {"run_id": run_id, "lease_expires_at": lease_expires_at},
+                )
+                updated = db.execute(
+                    "SELECT * FROM approval_requests WHERE id=?", (row["id"],)
+                ).fetchone()
+                result = self._approval(updated)
+                result["run_id"] = run_id
+                result["provider_key"] = provider_key
+        if expired:
+            raise PermissionError("approval expired before execution")
+        if result is None:
+            raise PermissionError("approval could not be claimed")
+        return result
+
+    def heartbeat_approval(
+        self,
+        approval_ref: str,
+        executor_id: str,
+        run_id: str,
+        lease_seconds: int = 900,
+    ) -> dict[str, Any]:
+        now = utcnow()
+        lease_seconds = max(60, min(lease_seconds, 3600))
+        with self._transaction() as db:
+            row = db.execute(
+                "SELECT * FROM approval_requests WHERE id=? OR approval_key=?",
+                (approval_ref, approval_ref),
+            ).fetchone()
+            if row is None:
+                raise KeyError(approval_ref)
+            if (
+                row["status"] != "executing"
+                or row["claimed_by"] != executor_id
+                or row["current_run_id"] != run_id
+            ):
+                raise PermissionError("approval execution fencing token is stale")
+            if (
+                not row["lease_expires_at"]
+                or datetime.fromisoformat(row["lease_expires_at"]) <= now
+            ):
+                raise LeaseExpiredError("approval execution lease expired")
+            lease_expires_at = (now + timedelta(seconds=lease_seconds)).isoformat()
+            db.execute(
+                """UPDATE approval_requests SET lease_expires_at=?,updated_at=?
+                    WHERE id=? AND current_run_id=? AND claimed_by=?""",
+                (lease_expires_at, now.isoformat(), row["id"], run_id, executor_id),
+            )
+            db.execute(
+                """UPDATE approval_runs SET heartbeat_at=?
+                    WHERE id=? AND approval_id=? AND executor_id=? AND status='running'""",
+                (now.isoformat(), run_id, row["id"], executor_id),
+            )
+            updated = db.execute(
+                "SELECT * FROM approval_requests WHERE id=?", (row["id"],)
+            ).fetchone()
+            return self._approval(updated)
+
+    def finish_approval(
+        self,
+        approval_ref: str,
+        executor_id: str,
+        run_id: str,
+        status: str,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        if status not in {"succeeded", "failed"}:
+            raise ValueError("invalid approval execution status")
+        encoded_result, _ = self._safe_json_object(result, "result")
+        now = utcnow()
+        with self._transaction() as db:
+            row = db.execute(
+                "SELECT * FROM approval_requests WHERE id=? OR approval_key=?",
+                (approval_ref, approval_ref),
+            ).fetchone()
+            if row is None:
+                raise KeyError(approval_ref)
+            prior_run = db.execute(
+                "SELECT * FROM approval_runs WHERE id=? AND approval_id=? AND executor_id=?",
+                (run_id, row["id"], executor_id),
+            ).fetchone()
+            if prior_run is not None and prior_run["status"] != "running":
+                if prior_run["status"] == "timed_out":
+                    raise PermissionError("approval execution fencing token is stale")
+                if prior_run["status"] == status and prior_run["result"] == encoded_result:
+                    return self._approval(row)
+                raise PermissionError("approval execution was already finished with another result")
+            if (
+                row["status"] != "executing"
+                or row["claimed_by"] != executor_id
+                or row["current_run_id"] != run_id
+            ):
+                raise PermissionError("approval execution fencing token is stale")
+            if (
+                not row["lease_expires_at"]
+                or datetime.fromisoformat(row["lease_expires_at"]) <= now
+            ):
+                raise LeaseExpiredError("approval execution lease expired")
+            cursor = db.execute(
+                """UPDATE approval_runs SET status=?,finished_at=?,heartbeat_at=?,result=?
+                    WHERE id=? AND approval_id=? AND executor_id=? AND status='running'""",
+                (
+                    status,
+                    now.isoformat(),
+                    now.isoformat(),
+                    encoded_result,
+                    run_id,
+                    row["id"],
+                    executor_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise PermissionError("approval execution is missing, stale, or already finished")
+            cursor = db.execute(
+                """UPDATE approval_requests SET status=?,claimed_by=NULL,lease_expires_at=NULL,
+                    current_run_id=NULL,version=version+1,updated_at=?
+                    WHERE id=? AND current_run_id=? AND claimed_by=?""",
+                (status, now.isoformat(), row["id"], run_id, executor_id),
+            )
+            if cursor.rowcount != 1:
+                raise PermissionError("approval execution fencing token is stale")
+            event_payload = {"run_id": run_id, "result": json.loads(encoded_result)}
+            self._approval_event(db, row["id"], f"approval.{status}", executor_id, event_payload)
+            if row["task_id"]:
+                self._event(db, row["task_id"], f"approval.{status}", executor_id, event_payload)
+            updated = db.execute(
+                "SELECT * FROM approval_requests WHERE id=?", (row["id"],)
+            ).fetchone()
+            return self._approval(updated)
+
+    def list_approval_runs(
+        self, approval_ref: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        params: list[Any] = []
+        where = ""
+        if approval_ref:
+            approval = self.get_approval(approval_ref)
+            if approval is None:
+                raise KeyError(approval_ref)
+            where = " WHERE approval_id=?"
+            params.append(approval["id"])
+        params.append(max(1, min(limit, 200)))
+        with self._connect() as db:
+            rows = db.execute(
+                f"SELECT * FROM approval_runs{where} ORDER BY started_at DESC LIMIT ?", params
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["result"] = json.loads(item["result"])
+            result.append(item)
+        return result
+
+    def reconcile_expired_approval_leases(
+        self, actor: str = "approval-lease-monitor"
+    ) -> dict[str, Any]:
+        now = utcnow()
+        released: list[dict[str, str]] = []
+        with self._transaction() as db:
+            rows = db.execute(
+                """SELECT * FROM approval_requests WHERE status='executing'
+                    AND lease_expires_at IS NOT NULL AND lease_expires_at<=?""",
+                (now.isoformat(),),
+            ).fetchall()
+            for row in rows:
+                next_status = (
+                    "approved"
+                    if row["expires_at"] and datetime.fromisoformat(row["expires_at"]) > now
+                    else "expired"
+                )
+                db.execute(
+                    """UPDATE approval_runs SET status='timed_out',finished_at=?,result=?
+                        WHERE id=? AND approval_id=? AND status='running'""",
+                    (
+                        now.isoformat(),
+                        json.dumps({"reason": "approval execution lease expired"}),
+                        row["current_run_id"],
+                        row["id"],
+                    ),
+                )
+                db.execute(
+                    """UPDATE approval_requests SET status=?,claimed_by=NULL,
+                        lease_expires_at=NULL,current_run_id=NULL,version=version+1,updated_at=?
+                        WHERE id=?""",
+                    (next_status, now.isoformat(), row["id"]),
+                )
+                payload = {
+                    "run_id": row["current_run_id"],
+                    "executor_id": row["claimed_by"],
+                    "next_status": next_status,
+                }
+                self._approval_event(db, row["id"], "approval.execution_timed_out", actor, payload)
+                if row["task_id"]:
+                    self._event(db, row["task_id"], "approval.execution_timed_out", actor, payload)
+                released.append(
+                    {"approval_key": row["approval_key"], "executor_id": row["claimed_by"]}
+                )
+            expired_rows = db.execute(
+                """SELECT * FROM approval_requests WHERE status IN ('approved','failed')
+                    AND expires_at IS NOT NULL AND expires_at<=?""",
+                (now.isoformat(),),
+            ).fetchall()
+            for row in expired_rows:
+                db.execute(
+                    """UPDATE approval_requests SET status='expired',version=version+1,
+                        updated_at=? WHERE id=? AND status IN ('approved','failed')""",
+                    (now.isoformat(), row["id"]),
+                )
+                payload = {"expired_at": row["expires_at"], "from": row["status"]}
+                self._approval_event(db, row["id"], "approval.expired", actor, payload)
+                if row["task_id"]:
+                    self._event(db, row["task_id"], "approval.expired", actor, payload)
+                released.append({"approval_key": row["approval_key"], "executor_id": ""})
+        return {"released": released, "count": len(released), "checked_at": now.isoformat()}
+
     def create_schedule(
         self,
         name: str,
@@ -1162,6 +1939,8 @@ class PmtStore:
     ) -> dict[str, Any]:
         if not name.strip() or not job_type.strip():
             raise ValueError("name and job_type are required")
+        if job_type.strip() not in SCHEDULE_JOB_TYPES:
+            raise ValueError("unsupported schedule job type")
         interval_seconds = max(60, min(interval_seconds, 31 * 24 * 3600))
         schedule_id = f"schedule_{uuid.uuid4().hex}"
         now = utcnow()
