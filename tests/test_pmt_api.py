@@ -384,6 +384,13 @@ def test_pmt_dashboard_requires_login_and_can_create_task(client):
     assert 'id="newTaskModal"' in dashboard.text
     assert 'class="modal-content pmt-modal-form' in dashboard.text
     assert "/static/pmt.css?v=20260713-kanban2" in dashboard.text
+    assert "/static/pmt-mobile.css?v=20260713-task-dropup1" in dashboard.text
+    assert "syncCreateTaskMenuDirection" in dashboard.text
+    assert "pmt-create-menu-open" in dashboard.text
+    mobile_css = client.get("/static/pmt-mobile.css?v=20260713-task-dropup1")
+    assert ".pmt-create-task-button.dropup .dropdown-menu" in mobile_css.text
+    assert "overflow: visible" in mobile_css.text
+    assert "margin-bottom: 0.5rem" in mobile_css.text
     assert 'id="task-search"' in dashboard.text
     assert '<option value="todo" selected>' in dashboard.text
     assert 'draggable="true"' in dashboard.text

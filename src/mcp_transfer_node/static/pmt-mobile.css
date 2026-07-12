@@ -103,6 +103,15 @@ html {
     scrollbar-width: none;
   }
 
+  .pmt-navbar .container-fluid > .d-flex:last-child.pmt-create-menu-open {
+    overflow: visible;
+  }
+
+  .pmt-create-task-button.dropup .dropdown-menu {
+    z-index: 1085;
+    margin-bottom: 0.5rem;
+  }
+
   .pmt-navbar .container-fluid > .d-flex:last-child::-webkit-scrollbar {
     display: none;
   }
