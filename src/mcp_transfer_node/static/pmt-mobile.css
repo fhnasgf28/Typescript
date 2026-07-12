@@ -312,3 +312,105 @@ html {
     transition: none !important;
   }
 }
+
+@media (max-width: 991.98px) {
+  body.pmt-body {
+    padding-bottom: calc(5.5rem + env(safe-area-inset-bottom));
+  }
+
+  body.pmt-body.pmt-tasks-page {
+    padding-bottom: calc(9rem + env(safe-area-inset-bottom));
+  }
+
+  .pmt-create-task-button {
+    position: fixed;
+    right: 0.75rem;
+    bottom: calc(5rem + env(safe-area-inset-bottom));
+    z-index: 1039;
+    display: inline-flex !important;
+    min-height: 3rem;
+    padding: 0.75rem 1rem !important;
+    align-items: center;
+    justify-content: center;
+    border-radius: 0.875rem;
+    box-shadow: 0 12px 28px rgba(79, 70, 229, 0.34);
+  }
+
+  .pmt-navbar {
+    background: rgba(255, 255, 255, 0.98);
+    box-shadow: 0 5px 18px rgba(26, 36, 58, 0.06);
+    backdrop-filter: none;
+  }
+
+  .pmt-navbar .pmt-primary-nav {
+    position: fixed;
+    right: 0.75rem;
+    bottom: max(0.625rem, env(safe-area-inset-bottom));
+    left: 0.75rem;
+    z-index: 1040;
+    display: grid !important;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 0.25rem !important;
+    width: auto !important;
+    max-width: none !important;
+    padding: 0.375rem;
+    margin: 0 !important;
+    overflow: visible !important;
+    background: rgba(255, 255, 255, 0.94);
+    border: 1px solid rgba(205, 214, 229, 0.9);
+    border-radius: 1rem;
+    box-shadow: 0 16px 38px rgba(24, 34, 58, 0.2);
+    backdrop-filter: blur(18px);
+  }
+
+  .pmt-navbar .pmt-primary-nav .btn {
+    display: inline-flex !important;
+    min-width: 0;
+    min-height: 3.2rem;
+    padding: 0.5rem 0.25rem;
+    align-items: center;
+    justify-content: center;
+    color: #667085;
+    font-size: 0.7rem;
+    font-weight: 750;
+    line-height: 1;
+    background: transparent;
+    border: 0 !important;
+    border-radius: 0.75rem !important;
+    box-shadow: none;
+  }
+
+  .pmt-navbar .pmt-primary-nav .pmt-btn-primary,
+  .pmt-navbar .pmt-primary-nav .pmt-btn-primary:hover,
+  .pmt-navbar .pmt-primary-nav .pmt-btn-primary:focus {
+    color: #fff;
+    background: linear-gradient(145deg, #6366f1, #4338ca);
+    box-shadow: 0 7px 16px rgba(79, 70, 229, 0.28);
+  }
+
+  section[aria-label="Ringkasan task"] > div:first-child .pmt-stat-card {
+    color: #fff;
+    background: linear-gradient(145deg, #6366f1, #4338ca);
+    border-color: transparent;
+    box-shadow: 0 14px 28px rgba(79, 70, 229, 0.24);
+  }
+
+  section[aria-label="Ringkasan task"] > div:first-child .pmt-muted {
+    color: rgba(255, 255, 255, 0.78);
+  }
+
+  section[aria-label="Ringkasan task"] > div:first-child .pmt-stat-dot {
+    background: #fff;
+    box-shadow: 0 0 0 0.3rem rgba(255, 255, 255, 0.16);
+  }
+
+  section[aria-label="Ringkasan task"] > div:first-child .pmt-stat-card::after {
+    background: #fff;
+    opacity: 0.1;
+  }
+
+  .pmt-task-card {
+    border-color: rgba(215, 222, 234, 0.92);
+    box-shadow: 0 6px 18px rgba(28, 39, 61, 0.065);
+  }
+}
