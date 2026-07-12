@@ -255,6 +255,42 @@ def pmt_create_task(
 
 
 @mcp.tool()
+def pmt_create_task_from_google_doc(
+    source_url: str,
+    idempotency_key: str,
+    title: str = "",
+    description: str = "",
+    project: str = "HMX",
+    module: str = "",
+    menu: str = "",
+    assignee: str = "Farhan",
+    priority: str = "normal",
+    target_branch: str = "Human-Resources",
+    acceptance_criteria: list[str] | None = None,
+    required_checks: list[str] | None = None,
+) -> dict[str, object]:
+    """Explicitly fetch a Google Doc and atomically create a task with metadata-only context."""
+    return _request(
+        "POST",
+        "/tasks/from-google-doc",
+        json_body={
+            "source_url": source_url,
+            "idempotency_key": idempotency_key,
+            "title": title,
+            "description": description,
+            "project": project,
+            "module": module,
+            "menu": menu,
+            "assignee": assignee,
+            "priority": priority,
+            "target_branch": target_branch,
+            "acceptance_criteria": acceptance_criteria or [],
+            "required_checks": required_checks or [],
+        },
+    )
+
+
+@mcp.tool()
 def pmt_update_task(
     task_ref: str,
     run_id: str,

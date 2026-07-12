@@ -30,9 +30,10 @@
           <span class="rounded-circle bg-success" style="width:.5rem;height:.5rem"></span>
           {{ online_agents }} agent aktif
         </span>
-        <button class="btn pmt-btn-primary pmt-create-task-button fw-semibold px-3" data-bs-toggle="modal" data-bs-target="#newTaskModal" type="button">
-          <span class="me-1">＋</span> Task baru
-        </button>
+        <div class="d-flex flex-wrap gap-2 pmt-create-task-button">
+          <button class="btn pmt-btn-primary fw-semibold px-3" data-bs-toggle="modal" data-bs-target="#newTaskModal" type="button">Task baru</button>
+          <a class="btn btn-light border rounded-3 fw-semibold px-3" href="/pmt/tasks/from-google-doc">From Google Docs</a>
+        </div>
         <div class="dropdown">
           <button class="btn btn-light border rounded-3 px-3" data-bs-toggle="dropdown" type="button" aria-expanded="false">•••</button>
           <ul class="dropdown-menu dropdown-menu-end shadow-sm">

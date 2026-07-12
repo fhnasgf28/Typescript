@@ -3,10 +3,11 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import re
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -60,6 +61,10 @@ AGENT_STATUS_TRANSITIONS = {
     "blocked": {"in_progress", "todo"},
 }
 MAX_CONTEXT_DOCUMENTS_PER_TASK = 5
+MAX_CREATE_IDEMPOTENCY_KEY_LENGTH = 240
+GOOGLE_DOC_TASK_DESCRIPTION = (
+    "Task dibuat dari Google Docs context. Gunakan snapshot terlampir sebagai requirement utama."
+)
 
 
 class LeaseExpiredError(PermissionError):
@@ -100,6 +105,25 @@ class TaskInput:
     target_branch: str = "Human-Resources"
     acceptance_criteria: tuple[str, ...] = ()
     required_checks: tuple[str, ...] = ()
+
+
+def derive_google_doc_task_title(snapshot: dict[str, Any], override: str = "") -> str:
+    """Build the bounded task title used by Google Docs task creation."""
+    normalized_override = re.sub(r"\s+", " ", override.strip())
+    if normalized_override:
+        return normalized_override[:300].rstrip()
+    document_title = re.sub(r"\s+", " ", str(snapshot.get("title", "")).strip())
+    selected_id = str(snapshot.get("selected_tab_id", ""))
+    selected_title = ""
+    for tab in snapshot.get("tabs", []):
+        if isinstance(tab, dict) and str(tab.get("tab_id", "")) == selected_id:
+            selected_title = re.sub(r"\s+", " ", str(tab.get("title", "")).strip())
+            break
+    if document_title and selected_title:
+        title = f"{document_title} — {selected_title}"
+    else:
+        title = document_title or selected_title or "Google Docs requirement"
+    return title[:300].rstrip()
 
 
 class PmtStore:
@@ -229,6 +253,13 @@ class PmtStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_task_context_tabs_order
                     ON task_context_tabs(context_document_id,order_index);
+                CREATE TABLE IF NOT EXISTS google_doc_task_creations (
+                    idempotency_key TEXT PRIMARY KEY,
+                    request_sha256 TEXT NOT NULL,
+                    task_id TEXT NOT NULL REFERENCES tasks(id),
+                    context_id TEXT NOT NULL REFERENCES task_context_documents(id),
+                    created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS agents (
                     agent_id TEXT PRIMARY KEY,
                     server_name TEXT NOT NULL,
@@ -647,74 +678,85 @@ class PmtStore:
         ).fetchone()
         return f"{prefix}-{int(row['value']):04d}"
 
-    def create_task(self, data: TaskInput, actor: str = "human") -> dict[str, Any]:
+    @staticmethod
+    def _validate_task_input(data: TaskInput) -> str:
         title = data.title.strip()
         if not title:
             raise ValueError("title is required")
         if data.priority not in TASK_PRIORITIES:
             raise ValueError(f"invalid priority: {data.priority}")
+        return title
+
+    def _insert_task_in_transaction(
+        self, db: sqlite3.Connection, data: TaskInput, actor: str
+    ) -> tuple[dict[str, Any], bool]:
+        title = self._validate_task_input(data)
+        if data.external_id:
+            existing = db.execute(
+                "SELECT * FROM tasks WHERE source=? AND external_id=?",
+                (data.source, data.external_id),
+            ).fetchone()
+            if existing is not None:
+                return self._task(existing), False
         task_id = f"task_{uuid.uuid4().hex}"
         now = iso()
-        with self._transaction() as db:
+        task_key = self._next_key(db)
+        try:
+            db.execute(
+                """
+                INSERT INTO tasks(
+                    id,task_key,title,description,project,module,menu,source,external_id,
+                    assignee,priority,status,target_branch,acceptance_criteria,required_checks,
+                    created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    task_id,
+                    task_key,
+                    title,
+                    data.description.strip(),
+                    data.project.strip() or "HMX",
+                    data.module.strip(),
+                    data.menu.strip(),
+                    data.source.strip() or "manual",
+                    data.external_id.strip(),
+                    data.assignee.strip(),
+                    data.priority,
+                    "todo",
+                    data.target_branch.strip() or "Human-Resources",
+                    json.dumps(
+                        [
+                            {
+                                "id": f"criterion_{uuid.uuid4().hex}",
+                                "text": text.strip(),
+                                "done": False,
+                            }
+                            for text in data.acceptance_criteria
+                            if text.strip()
+                        ]
+                    ),
+                    json.dumps(list(data.required_checks)),
+                    now,
+                    now,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
             if data.external_id:
                 existing = db.execute(
                     "SELECT * FROM tasks WHERE source=? AND external_id=?",
                     (data.source, data.external_id),
                 ).fetchone()
                 if existing is not None:
-                    return self._task(existing)
-            task_key = self._next_key(db)
-            try:
-                db.execute(
-                    """
-                    INSERT INTO tasks(
-                        id,task_key,title,description,project,module,menu,source,external_id,
-                        assignee,priority,status,target_branch,acceptance_criteria,required_checks,
-                        created_at,updated_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    """,
-                    (
-                        task_id,
-                        task_key,
-                        title,
-                        data.description.strip(),
-                        data.project.strip() or "HMX",
-                        data.module.strip(),
-                        data.menu.strip(),
-                        data.source.strip() or "manual",
-                        data.external_id.strip(),
-                        data.assignee.strip(),
-                        data.priority,
-                        "todo",
-                        data.target_branch.strip() or "Human-Resources",
-                        json.dumps(
-                            [
-                                {
-                                    "id": f"criterion_{uuid.uuid4().hex}",
-                                    "text": text.strip(),
-                                    "done": False,
-                                }
-                                for text in data.acceptance_criteria
-                                if text.strip()
-                            ]
-                        ),
-                        json.dumps(list(data.required_checks)),
-                        now,
-                        now,
-                    ),
-                )
-            except sqlite3.IntegrityError as exc:
-                if data.external_id:
-                    existing = db.execute(
-                        "SELECT * FROM tasks WHERE source=? AND external_id=?",
-                        (data.source, data.external_id),
-                    ).fetchone()
-                    if existing is not None:
-                        return self._task(existing)
-                raise ValueError("task key or external source already exists") from exc
-            self._event(db, task_id, "task.created", actor, {"task_key": task_key})
-            row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
-            return self._task(row)
+                    return self._task(existing), False
+            raise ValueError("task key or external source already exists") from exc
+        self._event(db, task_id, "task.created", actor, {"task_key": task_key})
+        row = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        return self._task(row), True
+
+    def create_task(self, data: TaskInput, actor: str = "human") -> dict[str, Any]:
+        with self._transaction() as db:
+            task, _created = self._insert_task_in_transaction(db, data, actor)
+            return task
 
     def list_tasks(
         self,
@@ -908,6 +950,213 @@ class PmtStore:
             raise ValueError("Google Docs snapshot hash is invalid") from exc
         return tabs, digest
 
+    @staticmethod
+    def _creation_request_hash(data: TaskInput, source_url: str, snapshot: dict[str, Any]) -> str:
+        request = {
+            "source_url": source_url,
+            "document_id": snapshot["document_id"],
+            "selected_tab_id": snapshot["selected_tab_id"],
+            "content_sha256": snapshot["content_sha256"],
+            "title": data.title.strip(),
+            "description": data.description.strip(),
+            "project": data.project.strip() or "HMX",
+            "module": data.module.strip(),
+            "menu": data.menu.strip(),
+            "source": data.source.strip() or "manual",
+            "external_id": data.external_id.strip(),
+            "assignee": data.assignee.strip(),
+            "priority": data.priority,
+            "target_branch": data.target_branch.strip() or "Human-Resources",
+            "acceptance_criteria": list(data.acceptance_criteria),
+            "required_checks": list(data.required_checks),
+        }
+        encoded = json.dumps(request, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def _insert_context_rows(
+        self,
+        db: sqlite3.Connection,
+        task_id: str,
+        context_id: str,
+        source_url: str,
+        snapshot: dict[str, Any],
+        tabs: list[dict[str, Any]],
+        digest: str,
+        context_version: int,
+        created_at: str,
+        now: str,
+    ) -> dict[str, Any]:
+        db.execute(
+            """INSERT INTO task_context_documents(
+                id,task_id,provider,source_url,external_id,selected_tab_id,title,revision_id,
+                content_sha256,context_version,tab_count,char_count,fetched_at,last_checked_at,
+                created_at,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                context_id,
+                task_id,
+                "google_docs",
+                source_url,
+                snapshot["document_id"],
+                snapshot["selected_tab_id"],
+                snapshot["title"],
+                snapshot["revision_id"],
+                digest,
+                context_version,
+                len(tabs),
+                snapshot["char_count"],
+                now,
+                now,
+                created_at,
+                now,
+            ),
+        )
+        for order_index, tab in enumerate(tabs):
+            encoded = json.dumps(
+                tab, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+            )
+            db.execute(
+                """INSERT INTO task_context_tabs(
+                    context_document_id,tab_id,parent_tab_id,depth,position,order_index,
+                    position_path,path,title,text,char_count,snapshot
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    context_id,
+                    tab["tab_id"],
+                    tab["parent_tab_id"],
+                    tab["depth"],
+                    tab["position"],
+                    order_index,
+                    json.dumps(tab["position_path"]),
+                    tab["path"],
+                    tab["title"],
+                    tab["text"],
+                    tab["char_count"],
+                    encoded,
+                ),
+            )
+        row = db.execute(
+            "SELECT * FROM task_context_documents WHERE id=?", (context_id,)
+        ).fetchone()
+        return self._context_document(row)
+
+    def _insert_initial_context(
+        self,
+        db: sqlite3.Connection,
+        task_id: str,
+        source_url: str,
+        snapshot: dict[str, Any],
+        actor: str,
+    ) -> dict[str, Any]:
+        tabs, digest = self._validated_context_snapshot(snapshot)
+        now = iso()
+        context_id = f"context_{uuid.uuid4().hex}"
+        context = self._insert_context_rows(
+            db,
+            task_id,
+            context_id,
+            source_url,
+            snapshot,
+            tabs,
+            digest,
+            1,
+            now,
+            now,
+        )
+        self._event(
+            db,
+            task_id,
+            "task.context_attached",
+            actor,
+            {
+                "context_id": context_id,
+                "provider": "google_docs",
+                "external_id": snapshot["document_id"],
+                "context_version": 1,
+                "content_sha256": digest,
+                "tab_count": len(tabs),
+                "char_count": snapshot["char_count"],
+            },
+        )
+        return context
+
+    def create_task_from_google_doc(
+        self,
+        data: TaskInput,
+        *,
+        source_url: str,
+        snapshot: dict[str, Any],
+        actor: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Atomically create a task and its already-fetched Google Docs snapshot."""
+        key = idempotency_key.strip()
+        if not key:
+            raise ValueError("idempotency_key is required")
+        if len(key) > MAX_CREATE_IDEMPOTENCY_KEY_LENGTH:
+            raise ValueError("idempotency_key exceeds allowed length")
+        data = replace(
+            data,
+            description=data.description.strip() or GOOGLE_DOC_TASK_DESCRIPTION,
+            source="google_docs",
+        )
+        self._validated_context_snapshot(snapshot)
+        request_hash = self._creation_request_hash(data, source_url, snapshot)
+        with self._transaction() as db:
+            existing = db.execute(
+                "SELECT * FROM google_doc_task_creations WHERE idempotency_key=?", (key,)
+            ).fetchone()
+            if existing is not None:
+                if existing["request_sha256"] != request_hash:
+                    raise ValueError("idempotency key was reused with different content")
+                task_row = db.execute(
+                    "SELECT * FROM tasks WHERE id=?", (existing["task_id"],)
+                ).fetchone()
+                context_row = db.execute(
+                    "SELECT * FROM task_context_documents WHERE id=?", (existing["context_id"],)
+                ).fetchone()
+                if task_row is None or context_row is None:
+                    raise RuntimeError("Google Docs task creation record is incomplete")
+                return {
+                    "task": self._task(task_row),
+                    "context": self._context_document(context_row),
+                    "created": False,
+                }
+            task, _created = self._insert_task_in_transaction(db, data, actor)
+            context = self._insert_initial_context(db, task["id"], source_url, snapshot, actor)
+            db.execute(
+                """INSERT INTO google_doc_task_creations(
+                    idempotency_key,request_sha256,task_id,context_id,created_at
+                ) VALUES(?,?,?,?,?)""",
+                (key, request_hash, task["id"], context["id"], iso()),
+            )
+            return {"task": task, "context": context, "created": True}
+
+    def get_google_doc_task_creation(
+        self, idempotency_key: str, source_url: str
+    ) -> dict[str, Any] | None:
+        key = idempotency_key.strip()
+        if not key:
+            return None
+        with self._connect() as db:
+            record = db.execute(
+                "SELECT task_id,context_id FROM google_doc_task_creations WHERE idempotency_key=?",
+                (key,),
+            ).fetchone()
+            if record is None:
+                return None
+            task_row = db.execute("SELECT * FROM tasks WHERE id=?", (record["task_id"],)).fetchone()
+            context_row = db.execute(
+                "SELECT * FROM task_context_documents WHERE id=?", (record["context_id"],)
+            ).fetchone()
+        if task_row is None or context_row is None:
+            raise RuntimeError("Google Docs task creation record is incomplete")
+        if context_row["source_url"] != source_url.strip():
+            raise ValueError("idempotency key was reused with a different source URL")
+        task = self._task(task_row)
+        context = self._context_document(context_row)
+        return {"task": task, "context": context, "created": False}
+
     def save_task_context_snapshot(
         self,
         task_ref: str,
@@ -997,55 +1246,18 @@ class PmtStore:
                 context_version = 1
                 created_at = now
 
-            db.execute(
-                """INSERT INTO task_context_documents(
-                    id,task_id,provider,source_url,external_id,selected_tab_id,title,revision_id,
-                    content_sha256,context_version,tab_count,char_count,fetched_at,last_checked_at,
-                    created_at,updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    context_id,
-                    task["id"],
-                    "google_docs",
-                    source_url,
-                    snapshot["document_id"],
-                    snapshot["selected_tab_id"],
-                    snapshot["title"],
-                    snapshot["revision_id"],
-                    digest,
-                    context_version,
-                    len(tabs),
-                    snapshot["char_count"],
-                    now,
-                    now,
-                    created_at,
-                    now,
-                ),
+            self._insert_context_rows(
+                db,
+                task["id"],
+                context_id,
+                source_url,
+                snapshot,
+                tabs,
+                digest,
+                context_version,
+                created_at,
+                now,
             )
-            for order_index, tab in enumerate(tabs):
-                encoded = json.dumps(
-                    tab, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
-                )
-                db.execute(
-                    """INSERT INTO task_context_tabs(
-                        context_document_id,tab_id,parent_tab_id,depth,position,order_index,
-                        position_path,path,title,text,char_count,snapshot
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (
-                        context_id,
-                        tab["tab_id"],
-                        tab["parent_tab_id"],
-                        tab["depth"],
-                        tab["position"],
-                        order_index,
-                        json.dumps(tab["position_path"]),
-                        tab["path"],
-                        tab["title"],
-                        tab["text"],
-                        tab["char_count"],
-                        encoded,
-                    ),
-                )
             event_type = (
                 "task.context_attached" if context_version == 1 else "task.context_refreshed"
             )
